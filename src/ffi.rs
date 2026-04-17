@@ -441,7 +441,7 @@ pub extern "C" fn pdf_document_has_structure_tree(handle: *mut PdfDocument) -> b
     if handle.is_null() {
         return false;
     }
-    let doc = handle_ref(handle);
+    let doc = handle_mut(handle);
     doc.structure_tree().ok().flatten().is_some()
 }
 
@@ -456,7 +456,7 @@ pub extern "C" fn pdf_document_extract_text(
         set_error(error_code, ERR_INVALID_ARG);
         return ptr::null_mut();
     }
-    let doc = handle_ref(handle);
+    let doc = handle_mut(handle);
     match doc.extract_text(page_index as usize) {
         Ok(text) => {
             set_error(error_code, ERR_SUCCESS);
@@ -5139,7 +5139,7 @@ pub extern "C" fn pdf_document_extract_chars(
         set_error(error_code, ERR_INVALID_ARG);
         return ptr::null_mut();
     }
-    let doc = handle_ref(handle);
+    let doc = handle_mut(handle);
     match doc.extract_chars(page_index as usize) {
         Ok(chars) => {
             set_error(error_code, ERR_SUCCESS);

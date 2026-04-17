@@ -4,13 +4,10 @@
 //! text characters with their Unicode mappings, font information, and
 //! bounding boxes.
 
-#![forbid(unsafe_code)]
-
 use crate::config::ExtractionProfile;
 use crate::content::graphics_state::{GraphicsStateStack, Matrix};
 use crate::content::operators::{Operator, TextElement};
 use crate::content::parse_and_execute_text_only;
-use crate::content::parse_content_stream_text_only;
 use crate::error::Result;
 use crate::extract_log_debug;
 use crate::fonts::FontInfo;
@@ -19,6 +16,7 @@ use crate::layout::{Color, FontWeight, TextChar, TextSpan};
 use crate::object::{Object, ObjectRef};
 use crate::pipeline::config::WordBoundaryMode;
 use crate::text::{BoundaryContext, CharacterInfo, DocumentScript, WordBoundaryDetector};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -518,16 +516,12 @@ pub struct SpanMergingConfig {
     pub citation_font_size_ratio: f32,
 
     /// When `false`, each `Tm` operator starts a fresh span regardless of position.
-    /// Use this to preserve column boundaries for callers that need per-positioned-run spans
-    /// (e.g. pdftotext `-bbox-layout` parity).
+    /// Use this to preserve per-positioned text runs for callers that need raw layout spans.
     ///
     /// # Warning
-    /// Disabling this on character-by-character-positioned PDFs (common in academic typesetting)
-    /// can produce very large span counts per page (100× or more).
+    /// Disabling this on character-positioned PDFs can produce very large span counts.
     ///
-    /// Default: `true` (existing behaviour preserved).
-    ///
-    /// Reference: ISO 32000-1 §9.4.2 / §9.4.4 NOTE 6.
+    /// **Default**: true
     pub merge_tm_tj_runs: bool,
 }
 
@@ -1328,16 +1322,8 @@ fn is_email_context(preceding_text: &str, following_text: &str) -> bool {
     // Only check the last ~64 bytes for email patterns to avoid O(n) scan
     // of the entire accumulated text (which would cause O(n²) in merge loop)
     let prev_start = preceding_text.len().saturating_sub(64);
-    // Round up to the next UTF-8 char boundary. `str::ceil_char_boundary`
-    // would do this in one line but it's only stable since Rust 1.91,
-    // above our MSRV (1.88 — pinned by transitive deps).
-    let prev_start = {
-        let mut i = prev_start;
-        while i < preceding_text.len() && !preceding_text.is_char_boundary(i) {
-            i += 1;
-        }
-        i
-    };
+    // Find a valid UTF-8 char boundary
+    let prev_start = preceding_text.ceil_char_boundary(prev_start);
     let prev = preceding_text[prev_start..].trim_end();
     let next = following_text.trim_start();
 
@@ -1561,19 +1547,15 @@ impl TjBuffer {
                         // Rare: multi-char mapping or unmapped byte
                         if let Some(s) = font.char_to_unicode(byte as u32) {
                             if s != "\u{FFFD}" {
-                                for ch in s.chars() {
-                                    if ch >= '\x20' || ch == '\t' || ch == '\n' || ch == '\r' {
-                                        self.unicode.push(ch);
-                                    }
+                                for ch in s.chars().filter_map(sanitize_extracted_unicode_char) {
+                                    self.unicode.push(ch);
                                 }
                             }
                         } else {
                             let fb = fallback_char_to_unicode(byte as u32);
                             if fb != "\u{FFFD}" {
-                                for ch in fb.chars() {
-                                    if ch >= '\x20' || ch == '\t' || ch == '\n' || ch == '\r' {
-                                        self.unicode.push(ch);
-                                    }
+                                for ch in fb.chars().filter_map(sanitize_extracted_unicode_char) {
+                                    self.unicode.push(ch);
                                 }
                             }
                         }
@@ -1751,6 +1733,21 @@ fn fallback_char_to_unicode(char_code: u32) -> String {
     }
 }
 
+fn sanitize_extracted_unicode_char(ch: char) -> Option<char> {
+    match ch {
+        '\0' => None,
+        '\t' | '\n' | '\r' => Some(ch),
+        _ if ch.is_control() => Some('\u{FFFD}'),
+        _ => Some(ch),
+    }
+}
+
+fn sanitize_extracted_unicode_string(raw: &str) -> String {
+    raw.chars()
+        .filter_map(sanitize_extracted_unicode_char)
+        .collect()
+}
+
 /// Byte grouping mode for CID font character code decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ByteMode {
@@ -1766,17 +1763,6 @@ enum ByteMode {
 fn get_byte_mode(font: Option<&FontInfo>) -> ByteMode {
     if let Some(font) = font {
         if font.subtype == "Type0" {
-            // If the ToUnicode CMap declares a 2-byte codespace range, always use
-            // TwoByte mode regardless of the encoding name.  This handles CJK fonts
-            // whose /Encoding name is a custom CMap stream that doesn't match the
-            // well-known keyword patterns below (e.g. "H", "V", "UniCNS-H", …).
-            // See PDF Spec §9.7.5 — `begincodespacerange` is authoritative.
-            if let Some(ref lazy_cmap) = font.to_unicode {
-                if lazy_cmap.code_width() == 2 {
-                    return ByteMode::TwoByte;
-                }
-            }
-
             match &font.encoding {
                 crate::fonts::Encoding::Identity => ByteMode::TwoByte,
                 crate::fonts::Encoding::Standard(name) => {
@@ -1901,15 +1887,17 @@ fn decode_text_to_unicode(bytes: &[u8], font: Option<&FontInfo>) -> String {
         bytes.iter().map(|&b| char::from(b)).collect()
     };
 
-    // Filter control characters from failed encoding resolution
-    // Keep: \t (0x09), \n (0x0A), \r (0x0D), and all printable chars (>= 0x20)
-    let mut filtered = String::with_capacity(raw_result.len());
-    for c in raw_result.chars() {
-        if c >= '\x20' || c == '\t' || c == '\n' || c == '\r' {
-            filtered.push(c);
+    sanitize_extracted_unicode_string(&raw_result)
+}
+
+fn collect_tj_string_bytes(array: &[TextElement]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for element in array {
+        if let TextElement::String(text) = element {
+            bytes.extend_from_slice(text);
         }
     }
-    filtered
+    bytes
 }
 
 /// Artifact type classification per PDF Spec Section 14.8.2.2
@@ -1973,7 +1961,7 @@ struct MarkedContentContext {
 /// - **Span mode** (default): Extracts complete text strings as PDF provides them (PDF spec compliant)
 /// - **Character mode**: Extracts individual characters (for special use cases)
 #[derive(Debug)]
-pub struct TextExtractor<'doc> {
+pub struct TextExtractor {
     /// Graphics state stack for handling q/Q operators
     state_stack: GraphicsStateStack,
     /// Loaded fonts (name -> FontInfo). Arc-wrapped to avoid deep cloning across pages.
@@ -1982,74 +1970,30 @@ pub struct TextExtractor<'doc> {
     spans: Vec<TextSpan>,
     /// Extracted characters (for backward compatibility)
     chars: Vec<TextChar>,
-    /// Resources dictionary (for accessing XObjects and fonts)
+    /// Runtime state for XObject/resource resolution.
     resources: Option<Object>,
-    /// Reference to the document (for loading XObjects)
-    document: Option<&'doc crate::document::PdfDocument>,
-    /// Set of processed XObject references to avoid duplicates.
-    /// Key is `(ObjectRef, ctm_key)` where `ctm_key` is the CTM at the time of
-    /// the `Do` operator call, encoded as 6 millipoint-rounded i64 values.
-    /// Using the CTM as part of the key allows the same Form XObject to be
-    /// processed multiple times when invoked with different transformation
-    /// matrices (e.g., the same XObject stamped at different positions on a page),
-    /// while still preventing infinite recursion (same ref + same CTM).
+    document: Option<*const crate::document::PdfDocument>,
+    /// Set of processed (XObject ref, caller CTM) pairs to avoid duplicate work
+    /// while still allowing the same Form XObject to be painted at distinct positions.
     processed_xobjects: HashSet<(ObjectRef, [i64; 6])>,
-    /// Cached XObject name → ObjectRef mapping for current resources context.
-    /// Avoids expensive repeated resolution of the resources/XObject dict chain.
     cached_xobject_refs: HashMap<String, Option<ObjectRef>>,
-    /// Current XObject recursion depth (0 = page level)
     xobject_depth: u32,
-    /// Number of XObjects decoded on this page (for budget limiting)
     xobject_decode_count: u32,
     /// Configuration for text extraction heuristics
     config: TextExtractionConfig,
     /// Configuration for span merging behavior
     merging_config: SpanMergingConfig,
-    /// Current marked content ID (for Tagged PDFs)
-    ///
-    /// Tracks the MCID of the currently active marked content sequence.
-    /// Used to associate extracted text with structure tree elements.
+    /// Runtime state for marked-content / artifact tracking.
     current_mcid: Option<u32>,
-    /// Stack of marked content contexts (per PDF Spec Section 14.6)
-    ///
-    /// Tracks nested marked content tags to enable artifact filtering.
-    /// When content is marked as `/Artifact`, it should be excluded from text extraction.
     marked_content_stack: Vec<MarkedContentContext>,
-    /// Whether we're currently inside an /Artifact marked content context
-    ///
-    /// Per PDF Spec Section 14.6, artifact content should be excluded from text extraction.
-    /// This flag is true when any ancestor in the marked_content_stack has is_artifact=true.
     inside_artifact: bool,
-    /// Extraction mode: true for spans, false for characters
+    /// Runtime state for span-mode extraction and Tj buffering.
     extract_spans: bool,
-    /// Buffer for accumulating consecutive Tj operators into single spans
-    ///
-    /// Per PDF Spec ISO 32000-1:2008 Section 9.4.4 NOTE 6, text strings should
-    /// be as long as possible. This buffer accumulates consecutive Tj operators
-    /// until a positioning command or state change is encountered.
     tj_span_buffer: Option<TjBuffer>,
-    /// Sequence counter for TextSpan ordering
-    ///
-    /// Used as a tie-breaker when sorting spans by Y-coordinate. Ensures
-    /// that spans with identical Y-coordinates maintain extraction order.
     span_sequence_counter: usize,
-    /// History of TJ array offsets for statistical analysis
-    ///
-    /// Tracks TJ offset values to detect justified vs. normal text through
-    /// statistical distribution analysis (coefficient of variation).
-    /// Used to dynamically adjust spacing thresholds per ISO 32000-1:2008 Section 9.4.4.
+    /// Runtime state for TJ-array character tracking and statistics.
     tj_offset_history: Vec<f32>,
-    /// Character-level tracking for word boundary detection
-    ///
-    /// Collects CharacterInfo for each character during TJ array processing.
-    /// This provides character-level positioning, width, and TJ offset data
-    /// to WordBoundaryDetector for primary word boundary detection.
-    /// Per ISO 32000-1:2008 Section 9.4.4, character-level analysis improves accuracy.
     tj_character_array: Vec<CharacterInfo>,
-    /// Current X position in text space for character tracking
-    ///
-    /// Updated as each character in a TJ array is processed. Used to calculate
-    /// x_position for CharacterInfo entries (not used after character collection).
     current_x_position: f32,
     /// Word boundary detection mode
     ///
@@ -2057,30 +2001,13 @@ pub struct TextExtractor<'doc> {
     /// - Tiebreaker: Only when TJ and geometric signals conflict (default)
     /// - Primary: Before creating TextSpans from tj_character_array
     word_boundary_mode: WordBoundaryMode,
-    /// Cached current font (updated on Tf). Avoids per-Tj HashMap lookup
-    /// in advance_position_for_string.
+    /// Cached current font for fast lookups.
     cached_current_font: Option<Arc<FontInfo>>,
+    /// Short history used to suppress near-duplicate glyph overprints during one extraction pass.
+    recent_plain_chars: Vec<TextChar>,
 }
 
-impl<'doc> TextExtractor<'doc> {
-    /// Fraction of a glyph's advance width considered "overlap" for
-    /// duplicate detection. Used by both `deduplicate_overlapping_chars`
-    /// and `deduplicate_overlapping_spans`.
-    ///
-    /// 0.30 comfortably catches real render-pass duplicates
-    /// (stroke+fill, bold shadow, outline+fill) which sit well under
-    /// 5 % of one advance apart, while staying below typical heaviest
-    /// kerning (≤ 20 % of advance) so legitimate narrow-glyph
-    /// neighbours (`ll`, `rr`, `II`, `ii`) are preserved.
-    const DEDUP_OVERLAP_RATIO: f32 = 0.30;
-
-    /// Absolute cap on the overlap window (in PDF points).
-    ///
-    /// Preserves pre-ratio v0.3.x behaviour for pathologically
-    /// oversized advance values (drop-caps, large display text) where
-    /// 30 % of the advance would swallow legitimate neighbours.
-    const DEDUP_OVERLAP_CAP_PT: f32 = 2.0;
-
+impl TextExtractor {
     /// Create a new text extractor with default configuration.
     ///
     /// # Examples
@@ -2135,6 +2062,7 @@ impl<'doc> TextExtractor<'doc> {
             current_x_position: 0.0,                     // Start at origin
             word_boundary_mode,                          // Word boundary detection mode
             cached_current_font: None,                   // Set on first Tf
+            recent_plain_chars: Vec::new(),
         }
     }
 
@@ -2161,6 +2089,49 @@ impl<'doc> TextExtractor<'doc> {
         self
     }
 
+    fn set_cached_current_font(&mut self, font: Option<Arc<FontInfo>>) {
+        if let (Some(current_font), Some(new_font)) =
+            (self.cached_current_font.as_ref(), font.as_ref())
+        {
+            if Arc::ptr_eq(current_font, new_font) {
+                return;
+            }
+        }
+        self.cached_current_font = font;
+    }
+
+    fn coarse_char_bbox(
+        &self,
+        origin_x: f32,
+        origin_y: f32,
+        advance_width: f32,
+        font_size: f32,
+    ) -> Rect {
+        Rect::new(origin_x, origin_y, advance_width.max(0.0), font_size.max(0.0))
+    }
+
+    fn resolve_unicode_string(&self, font_ref: Option<&FontInfo>, char_code: u32) -> String {
+        if let Some(font) = font_ref {
+            font.char_to_unicode(char_code)
+                .unwrap_or_else(|| fallback_char_to_unicode(char_code))
+        } else if char_code < 256 && (char_code as u8).is_ascii() {
+            (char_code as u8 as char).to_string()
+        } else {
+            "?".to_string()
+        }
+    }
+
+    fn sync_cached_current_font_from_state(&mut self) {
+        let font = self
+            .state_stack
+            .current()
+            .font_name
+            .as_ref()
+            .and_then(|name| self.fonts.get(name))
+            .cloned();
+        self.set_cached_current_font(font);
+    }
+
     /// Set the resources dictionary for this extractor.
     ///
     /// This allows the extractor to access XObjects and fonts during extraction.
@@ -2169,34 +2140,89 @@ impl<'doc> TextExtractor<'doc> {
     }
 
     /// Set the document reference for loading XObjects.
-    pub fn set_document(&mut self, document: &'doc crate::document::PdfDocument) {
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the document pointer remains valid for the lifetime
+    /// of this extractor. This is safe when used within PdfDocument methods.
+    pub fn set_document(&mut self, document: *const crate::document::PdfDocument) {
         self.document = Some(document);
     }
 
     // ========================================================================
-    // Debug/profiling helpers — exposed for examples/debug_katalog.rs
+    // Test-only helpers
     // ========================================================================
 
-    /// Convenience wrapper: identical to `set_document`.
-    pub fn set_document_ptr(&mut self, doc: &'doc crate::document::PdfDocument) {
-        self.set_document(doc);
+    /// Convenience wrapper: set document from a reference (avoids raw pointer in caller).
+    #[cfg(test)]
+    pub(crate) fn set_document_ptr(&mut self, doc: &crate::document::PdfDocument) {
+        self.document = Some(doc as *const crate::document::PdfDocument);
     }
 
     /// Prepare for span extraction mode (same setup as extract_text_spans preamble).
-    pub fn prepare_for_span_extraction(&mut self) {
+    #[cfg(test)]
+    pub(crate) fn prepare_for_span_extraction(&mut self) {
         self.extract_spans = true;
         self.spans.clear();
         self.span_sequence_counter = 0;
     }
 
     /// Public wrapper for execute_operator (normally private).
-    pub fn execute_operator_public(&mut self, op: crate::content::Operator) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn execute_operator_public(&mut self, op: crate::content::Operator) -> Result<()> {
         self.execute_operator(op)
     }
 
     /// Public wrapper for flush_tj_span_buffer (normally private).
-    pub fn flush_public(&mut self) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn flush_public(&mut self) -> Result<()> {
         self.flush_tj_span_buffer()
+    }
+
+    fn push_extracted_char(&mut self, text_char: TextChar, char_code: u32, dedupe_threshold: f32) {
+        if text_char.char.is_whitespace()
+            && self
+                .chars
+                .last()
+                .is_some_and(|previous| previous.char.is_whitespace())
+        {
+            return;
+        }
+
+        if self.should_suppress_near_duplicate_char(&text_char, char_code, dedupe_threshold) {
+            return;
+        }
+
+        self.record_recent_plain_char(&text_char);
+        self.chars.push(text_char);
+    }
+    fn record_recent_plain_char(&mut self, text_char: &TextChar) {
+        if self.recent_plain_chars.len() >= 8 {
+            self.recent_plain_chars.remove(0);
+        }
+        self.recent_plain_chars.push(text_char.clone());
+    }
+
+    fn should_suppress_near_duplicate_char(
+        &self,
+        text_char: &TextChar,
+        _char_code: u32,
+        dedupe_threshold: f32,
+    ) -> bool {
+        if dedupe_threshold <= 0.0 {
+            return false;
+        }
+
+        self.recent_plain_chars
+            .iter()
+            .rev()
+            .take(7)
+            .any(|previous| {
+                previous.char == text_char.char
+                    && previous.font_name == text_char.font_name
+                    && (previous.origin_x - text_char.origin_x).abs() < dedupe_threshold
+                    && (previous.origin_y - text_char.origin_y).abs() < dedupe_threshold
+            })
     }
 
     /// Calculate adaptive TJ offset threshold based on font size and text justification.
@@ -2422,13 +2448,6 @@ impl<'doc> TextExtractor<'doc> {
     }
 
     /// Decode a PDF text string (handles UTF-16BE/LE with BOM and PDFDocEncoding).
-    ///
-    /// Per ISO 32000 §7.9.2, strings without a UTF-16 BOM are PDFDocEncoding.
-    /// We try UTF-8 first as a lenient path for non-spec-compliant PDFs that
-    /// embed raw UTF-8 without a BOM; if that fails we fall back to the correct
-    /// PDFDocEncoding lookup (which handles the 0x80–0x9E special-char zone and
-    /// maps 0xA0–0xFF as ISO Latin-1, unlike from_utf8_lossy which substitutes
-    /// U+FFFD for any byte that is not valid UTF-8).
     fn decode_pdf_text_string(bytes: &[u8]) -> String {
         if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
             // UTF-16BE with BOM
@@ -2447,8 +2466,8 @@ impl<'doc> TextExtractor<'doc> {
             String::from_utf16(&utf16_pairs)
                 .unwrap_or_else(|_| String::from_utf8_lossy(bytes).to_string())
         } else {
-            // Try UTF-8 first (lenient: some PDFs embed raw UTF-8 without a BOM).
-            // Fall back to PDFDocEncoding per ISO 32000 §7.9.2.
+            // Try UTF-8 first for non-spec-compliant PDFs that embed raw UTF-8.
+            // Otherwise decode as PDFDocEncoding per ISO 32000 §7.9.2.
             String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| {
                 bytes
                     .iter()
@@ -2472,21 +2491,24 @@ impl<'doc> TextExtractor<'doc> {
         let prop_name = properties.as_name()?;
         let resources = self.resources.as_ref()?;
         let res_dict = if let Some(res_ref) = resources.as_reference() {
-            self.document?.load_object(res_ref).ok()?
+            let doc = unsafe { &*self.document? };
+            doc.load_object(res_ref).ok()?
         } else {
             resources.clone()
         };
         let res_dict = res_dict.as_dict()?;
         let properties_dict_obj = res_dict.get("Properties")?;
         let properties_dict = if let Some(r) = properties_dict_obj.as_reference() {
-            self.document?.load_object(r).ok()?
+            let doc = unsafe { &*self.document? };
+            doc.load_object(r).ok()?
         } else {
             properties_dict_obj.clone()
         };
         let properties_dict = properties_dict.as_dict()?;
         let prop_obj = properties_dict.get(prop_name)?;
         let resolved = if let Some(r) = prop_obj.as_reference() {
-            self.document?.load_object(r).ok()?
+            let doc = unsafe { &*self.document? };
+            doc.load_object(r).ok()?
         } else {
             prop_obj.clone()
         };
@@ -2504,7 +2526,7 @@ impl<'doc> TextExtractor<'doc> {
     fn get_current_actual_text(&self) -> Option<String> {
         self.marked_content_stack
             .iter()
-            .rev()  // Search from innermost (most recent) context
+            .rev() // Search from innermost (most recent) context
             .find_map(|ctx| ctx.actual_text.clone())
     }
 
@@ -2726,6 +2748,7 @@ impl<'doc> TextExtractor<'doc> {
         // Enable span extraction mode
         self.extract_spans = true;
         self.spans.clear();
+        self.recent_plain_chars.clear();
         self.span_sequence_counter = 0; // Reset sequence counter for this page
 
         // Streaming parse+execute: operators are processed immediately without
@@ -2761,8 +2784,13 @@ impl<'doc> TextExtractor<'doc> {
 
         // Merge adjacent spans on the same line to reconstruct complete words
         self.merge_adjacent_spans();
+        self.recent_plain_chars.clear();
 
         Ok(std::mem::take(&mut self.spans))
+    }
+
+    fn execute_text_only_stream(&mut self, content_stream: &[u8]) -> Result<()> {
+        parse_and_execute_text_only(content_stream, |op| self.execute_operator(op))
     }
 
     /// Extract individual characters from a PDF content stream.
@@ -2770,33 +2798,24 @@ impl<'doc> TextExtractor<'doc> {
     /// This is a low-level method that extracts characters one by one.
     /// For most use cases, prefer using `extract_text_spans()` which groups
     /// characters into text spans according to PDF semantics.
-    pub fn extract(&mut self, content_stream: &[u8]) -> Result<Vec<TextChar>> {
+    fn extract_chars_internal(&mut self, content_stream: &[u8]) -> Result<()> {
         // Enable character extraction mode
         self.extract_spans = false;
+        self.recent_plain_chars.clear();
         self.chars.clear();
         self.spans.clear(); // Ensure spans are clear so they don't poison xobject_spans_cache
 
-        // Parse content stream into operators
-        let operators = parse_content_stream_text_only(content_stream)?;
+        self.execute_text_only_stream(content_stream)?;
 
-        // Execute each operator
-        for op in operators {
-            self.execute_operator(op)?;
-        }
-
-        // BUG FIX #2: Sort characters by reading order (top-to-bottom, left-to-right)
-        // PDF content streams are in rendering order, not reading order.
-        // PDF Y coordinates increase upward, so higher Y = top of page.
-        // We need to sort by Y descending (top first), then X ascending (left to right).
         self.sort_by_reading_order();
-
-        // BUG FIX #3: Deduplicate overlapping characters
-        // Some PDFs render text multiple times (for effects like boldness, shadowing).
-        // This causes characters to appear at very close X positions (< 2pt).
-        // We deduplicate by keeping only the first character when multiple chars
-        // at the same Y position have X positions within 2pt of each other.
         self.deduplicate_overlapping_chars();
+        self.recent_plain_chars.clear();
+        Ok(())
+    }
 
+    /// Extract individual characters from a PDF content stream.
+    pub fn extract(&mut self, content_stream: &[u8]) -> Result<Vec<TextChar>> {
+        self.extract_chars_internal(content_stream)?;
         Ok(self.chars.clone())
     }
 
@@ -2807,83 +2826,87 @@ impl<'doc> TextExtractor<'doc> {
     /// all renders are extracted. We keep only one character when multiple chars
     /// at nearly the same position exist.
     ///
-    /// Heuristic: If two consecutive characters on the same line (Y rounded to
-    /// integer) overlap by a fraction of their own advance width, keep only the
-    /// first one.
-    ///
-    /// The threshold is expressed as a fraction of the glyph's `advance_width`
-    /// (see [`Self::DEDUP_OVERLAP_RATIO`]) rather than an absolute point
-    /// value. Real rendering duplicates (stroke+fill, bold shadow,
-    /// outline+fill) sit at nearly identical positions — well under 30 % of
-    /// one advance apart. Legitimate adjacent doublets of narrow glyphs
-    /// (`ll`, `rr`, `II`, `ii` at small font sizes) are separated by one
-    /// full advance; an absolute threshold of e.g. 2 pt would wrongly
-    /// collapse them on fonts where a narrow glyph's advance drops below
-    /// ~2 pt (e.g. Helvetica at ≤ 9 pt).
-    ///
-    /// Capped at [`Self::DEDUP_OVERLAP_CAP_PT`] to preserve the existing
-    /// behaviour for pathologically oversized advance values, and falls
-    /// back to `bbox.width` when `advance_width` is missing from the font
-    /// dictionary.
+    /// Heuristic: If two consecutive characters on the same line (Y rounded to integer)
+    /// are within 2pt horizontally, keep only the first one.
     fn deduplicate_overlapping_chars(&mut self) {
-        if self.chars.is_empty() {
-            return;
+        let original_len = self.chars.len();
+        let deduplicated = Self::deduplicate_char_like(self.chars.as_slice(), |ch| ch);
+        self.chars = deduplicated;
+        log::debug!(
+            "Deduplicated {} overlapping characters ({} -> {} chars)",
+            original_len - self.chars.len(),
+            original_len,
+            self.chars.len()
+        );
+    }
+
+    fn deduplicate_char_like<T: Clone, F>(items: &[T], text_char: F) -> Vec<T>
+    where
+        F: Fn(&T) -> &TextChar,
+    {
+        if items.is_empty() {
+            return Vec::new();
         }
 
-        let mut deduplicated = Vec::with_capacity(self.chars.len());
+        let mut deduplicated = Vec::with_capacity(items.len());
         let mut prev_y_rounded: Option<i32> = None;
-        let mut prev_x: Option<f32> = None;
         let mut prev_char: Option<char> = None;
+        let mut prev_origin_x: Option<f32> = None;
+        let mut prev_left: Option<f32> = None;
+        let mut prev_right: Option<f32> = None;
+        let mut prev_width: Option<f32> = None;
+        let mut prev_advance: Option<f32> = None;
 
-        for ch in self.chars.iter() {
+        for item in items {
+            let ch = text_char(item);
             let y_rounded = ch.bbox.y.round() as i32;
-            let x = ch.bbox.x;
 
-            // Check if this char overlaps with the previous one
-            let should_skip = if let (Some(prev_y), Some(prev_x_val), Some(prev_ch)) =
-                (prev_y_rounded, prev_x, prev_char)
-            {
-                // Reference width: advance_width if known, else bbox.width,
-                // else the legacy cap (keeps behaviour for pathological
-                // inputs without advance metrics).
-                let ref_width = if ch.advance_width > 0.0 {
-                    ch.advance_width
-                } else if ch.bbox.width > 0.0 {
-                    ch.bbox.width
-                } else {
-                    Self::DEDUP_OVERLAP_CAP_PT
-                };
-                let threshold =
-                    (ref_width * Self::DEDUP_OVERLAP_RATIO).min(Self::DEDUP_OVERLAP_CAP_PT);
-                // Same character, same line, and within `threshold` horizontally
-                ch.char == prev_ch && y_rounded == prev_y && (x - prev_x_val).abs() < threshold
+            let should_skip = if let (
+                Some(prev_y),
+                Some(prev_origin_x_val),
+                Some(prev_left_val),
+                Some(prev_right_val),
+                Some(prev_width_val),
+                Some(prev_advance_val),
+                Some(prev_ch),
+            ) = (
+                prev_y_rounded,
+                prev_origin_x,
+                prev_left,
+                prev_right,
+                prev_width,
+                prev_advance,
+                prev_char,
+            ) {
+                let overlap_left = ch.bbox.left().max(prev_left_val);
+                let overlap_right = ch.bbox.right().min(prev_right_val);
+                let overlap = (overlap_right - overlap_left).max(0.0);
+                let min_width = ch.bbox.width.min(prev_width_val).max(0.01);
+                let overlap_ratio = overlap / min_width;
+                let origin_delta = (ch.origin_x - prev_origin_x_val).abs();
+                let duplicate_origin_threshold =
+                    prev_advance_val.abs().min(ch.advance_width.abs()).max(0.5) * 0.25;
+
+                ch.char == prev_ch
+                    && y_rounded == prev_y
+                    && (overlap_ratio >= 0.5 || origin_delta <= duplicate_origin_threshold)
             } else {
                 false
             };
 
             if !should_skip {
-                deduplicated.push(ch.clone());
+                deduplicated.push(item.clone());
                 prev_y_rounded = Some(y_rounded);
-                prev_x = Some(x);
                 prev_char = Some(ch.char);
-            } else {
-                log::trace!(
-                    "Deduplicating overlapping char '{}' at X={:.1}, Y={:.1} (too close to previous)",
-                    ch.char,
-                    x,
-                    ch.bbox.y
-                );
+                prev_origin_x = Some(ch.origin_x);
+                prev_left = Some(ch.bbox.left());
+                prev_right = Some(ch.bbox.right());
+                prev_width = Some(ch.bbox.width);
+                prev_advance = Some(ch.advance_width);
             }
         }
 
-        log::debug!(
-            "Deduplicated {} overlapping characters ({} -> {} chars)",
-            self.chars.len() - deduplicated.len(),
-            self.chars.len(),
-            deduplicated.len()
-        );
-
-        self.chars = deduplicated;
+        deduplicated
     }
 
     /// Sort extracted text spans by reading order (top-to-bottom, left-to-right).
@@ -3061,18 +3084,8 @@ impl<'doc> TextExtractor<'doc> {
     /// Deduplicate overlapping text spans on the same line.
     ///
     /// Uses hybrid geometric + content-based deduplication:
-    /// - Geometric check (same Y, X within a fraction of the span's per-glyph
-    ///   advance) — catches identical positions
-    /// - Content check (same text, same line Y, different X) — catches
-    ///   duplicates across columns
-    ///
-    /// The geometric threshold is expressed as a fraction of the span's
-    /// per-glyph width (bbox.width / char_count), capped by
-    /// [`Self::DEDUP_OVERLAP_CAP_PT`] and scaled by
-    /// [`Self::DEDUP_OVERLAP_RATIO`]. An absolute threshold would wrongly
-    /// collapse legitimate single-glyph spans of adjacent narrow glyphs
-    /// (`ll`, `rr`, `II`, `ii` at small font sizes) in PDFs that emit text
-    /// glyph-by-glyph with kerning.
+    /// - Geometric check (same Y, X within 2pt) - catches identical positions
+    /// - Content check (same text, same line Y, different X) - catches duplicates across columns
     fn deduplicate_overlapping_spans(&mut self) {
         if self.spans.is_empty() {
             return;
@@ -3109,14 +3122,7 @@ impl<'doc> TextExtractor<'doc> {
             let geometric_duplicate = if let (Some(prev_y), Some(prev_x_val), Some(ref prev_txt)) =
                 (prev_y_rounded, prev_x, &prev_text)
             {
-                // Threshold scales with the span's per-glyph advance so that
-                // single-glyph narrow spans (`l`, `r`, `I`) are never wrongly
-                // treated as overlapping with their legitimate neighbour.
-                let char_count = span.text.chars().count().max(1) as f32;
-                let per_glyph_width = (span.bbox.width / char_count).max(0.1);
-                let threshold =
-                    (per_glyph_width * Self::DEDUP_OVERLAP_RATIO).min(Self::DEDUP_OVERLAP_CAP_PT);
-                y_rounded == prev_y && (x - prev_x_val).abs() < threshold && span.text == *prev_txt
+                y_rounded == prev_y && (x - prev_x_val).abs() < 2.0 && span.text == *prev_txt
             } else {
                 false
             };
@@ -3283,6 +3289,7 @@ impl<'doc> TextExtractor<'doc> {
             // Gap between end of current span and start of next span
             let current_end_x = current.bbox.x + current.bbox.width;
             let gap = span.bbox.x - current_end_x;
+
             // Fallback-width correction (issue #328): When the previous
             // span's font has no explicit `/Widths` array, every glyph in
             // that span reports the 500/550/600-thousandths-of-em fallback
@@ -3350,50 +3357,18 @@ impl<'doc> TextExtractor<'doc> {
             // and one side is a single character. Targets the drop-cap /
             // single-letter-small-caps typography pattern where per-
             // letter emphasis runs would corrupt proper nouns.
-            //
-            // Issue 484 (pr-136-example.pdf): CJK ideographs satisfy
-            // `is_alphabetic()` per Unicode, so a CJK→Latin (or Latin→CJK)
-            // transition between adjacent characters in different fonts —
-            // the standard mixed-script PDF layout pattern — was triggering
-            // cross-font glue and concatenating "神鹰集团" + "Z" into
-            // "神鹰集团Z" with no separator.  Word-F1 against pdftotext
-            // ground truth (which inserts a space at every CJK↔non-CJK
-            // boundary) then loses both the trailing CJK token and the
-            // leading Latin/digit token.  Skip cross-font glue when the
-            // boundary crosses CJK / non-CJK scripts.
-            //
-            // EXCLUDES fullwidth ASCII (U+FF01..FF5E) and CJK Symbols and
-            // Punctuation (U+3000..303F) — those operator-style glyphs sit
-            // inline with adjacent Latin/digit in CJK technical writing
-            // (e.g. "60000≤Q＜80000" in issue-336).  Treating them as a CJK
-            // boundary would split the compound token.
-            let is_cjk_char = |c: char| {
-                matches!(
-                    c as u32,
-                    0x3040..=0x309F      // Hiragana
-                    | 0x30A0..=0x30FF    // Katakana
-                    | 0x3400..=0x4DBF    // CJK Unified Ideographs Extension A
-                    | 0x4E00..=0x9FFF    // CJK Unified Ideographs
-                    | 0xAC00..=0xD7AF    // Hangul Syllables
-                    | 0x20000..=0x2A6DF  // CJK Unified Ideographs Extension B
-                    | 0xFF66..=0xFF9F    // Halfwidth Katakana
-                )
-            };
-            let prev_tail_char = current.text.chars().last();
-            let curr_head_char = span.text.chars().next();
-            let crosses_cjk_boundary = match (prev_tail_char, curr_head_char) {
-                (Some(p), Some(c)) => is_cjk_char(p) != is_cjk_char(c),
-                _ => false,
-            };
             let cross_font_word_glue = !is_same_font
                 && same_line
                 && gap > -1.0
                 && gap < font_size_ref * 0.25
                 && !current.text.is_empty()
                 && !span.text.is_empty()
-                && !crosses_cjk_boundary
-                && prev_tail_char.is_some_and(|c| c.is_alphabetic())
-                && curr_head_char.is_some_and(|c| c.is_alphabetic())
+                && current
+                    .text
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_alphabetic())
+                && span.text.chars().next().is_some_and(|c| c.is_alphabetic())
                 && (current.text.chars().count() == 1 || span.text.chars().count() == 1);
 
             // Merge threshold: Use configured values
@@ -3421,19 +3396,9 @@ impl<'doc> TextExtractor<'doc> {
             // of dollar amounts in separate fixed-width boxes.
             // e.g., "123456" (integer box) + "72" (cents box) with ~10pt gap.
             // Detect this pattern: both spans are pure digits, the second is
-            // exactly 1-2 digits (cents), same line, and there's a meaningful
-            // column-boundary-sized gap between them.
-            //
-            // Issue 484 (pr-136-example.pdf): without a minimum-gap floor this
-            // also matches tightly-packed adjacent digit characters from CJK
-            // documents that emit each glyph as its own Tj — e.g. the year
-            // "2013" rendered as four separate TjL operators with sub-pixel
-            // gaps was being mangled into "201.3", losing the year token from
-            // word-F1 scoring.  Real "$123 _ 45" split-box layouts always have
-            // a gap > ~half the font size; tight letter spacing is < 0.1 em.
-            let min_decimal_gap = current.font_size * 0.4;
+            // exactly 1-2 digits (cents), same line, and gap < 2x font size.
             let decimal_merge = same_line
-                && gap > min_decimal_gap
+                && gap > 0.0
                 && gap < current.font_size * 2.0
                 && !current.text.is_empty()
                 && !span.text.is_empty()
@@ -3604,49 +3569,51 @@ impl<'doc> TextExtractor<'doc> {
     /// This is critical for proper text extraction as PDF content streams are
     /// organized for rendering efficiency, not reading order.
     fn sort_by_reading_order(&mut self) {
-        self.chars.sort_by(|a, b| {
-            // Handle NaN/Inf values - treat them as at the end
-            if !a.bbox.y.is_finite() {
-                return if b.bbox.y.is_finite() {
-                    std::cmp::Ordering::Greater
-                } else {
-                    std::cmp::Ordering::Equal
-                };
-            }
-            if !b.bbox.y.is_finite() {
-                return std::cmp::Ordering::Less;
-            }
+        self.chars.sort_by(Self::compare_text_chars_reading_order);
+    }
 
-            // Sort by Y descending (top first), then by X ascending (left to right)
-            // Round Y coordinates to ensure transitivity of the comparison function
-            let a_y_rounded = a.bbox.y.round() as i32;
-            let b_y_rounded = b.bbox.y.round() as i32;
+    fn compare_text_chars_reading_order(a: &TextChar, b: &TextChar) -> Ordering {
+        // Use baseline origin for row ordering so tight descender boxes
+        // do not reorder characters from the same text run.
+        if !a.origin_y.is_finite() {
+            return if b.origin_y.is_finite() {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            };
+        }
+        if !b.origin_y.is_finite() {
+            return Ordering::Less;
+        }
 
-            match b_y_rounded.cmp(&a_y_rounded) {
-                std::cmp::Ordering::Equal => {
-                    // Same line: sort by X ascending (left to right)
-                    if !a.bbox.x.is_finite() {
-                        return if b.bbox.x.is_finite() {
-                            std::cmp::Ordering::Greater
-                        } else {
-                            std::cmp::Ordering::Equal
-                        };
-                    }
-                    if !b.bbox.x.is_finite() {
-                        return std::cmp::Ordering::Less;
-                    }
+        // Sort by baseline Y descending (top first), then by X ascending.
+        let a_y_rounded = a.origin_y.round() as i32;
+        let b_y_rounded = b.origin_y.round() as i32;
 
-                    if a.bbox.x < b.bbox.x {
-                        std::cmp::Ordering::Less
-                    } else if a.bbox.x > b.bbox.x {
-                        std::cmp::Ordering::Greater
+        match b_y_rounded.cmp(&a_y_rounded) {
+            Ordering::Equal => {
+                // Same line: sort by X ascending (left to right)
+                if !a.bbox.x.is_finite() {
+                    return if b.bbox.x.is_finite() {
+                        Ordering::Greater
                     } else {
-                        std::cmp::Ordering::Equal
-                    }
-                },
-                other => other,
-            }
-        });
+                        Ordering::Equal
+                    };
+                }
+                if !b.bbox.x.is_finite() {
+                    return Ordering::Less;
+                }
+
+                if a.bbox.x < b.bbox.x {
+                    Ordering::Less
+                } else if a.bbox.x > b.bbox.x {
+                    Ordering::Greater
+                } else {
+                    a.origin_y.total_cmp(&b.origin_y)
+                }
+            },
+            other => other,
+        }
     }
 
     /// ISSUE 1 FIX: Split fused words created by PDF authoring defects
@@ -3785,20 +3752,23 @@ impl<'doc> TextExtractor<'doc> {
         match op {
             // Text state operators
             Operator::Tf { font, size } => {
-                // Skip flush + lookup when font name AND size haven't changed.
+                // Skip all work when font name AND size haven't changed.
                 // Many PDFs redundantly set the same font (e.g., Tf after q/Q).
-                let same_font = {
+                let (same_font_name, same_font_and_size) = {
                     let state = self.state_stack.current();
-                    state.font_size == size && state.font_name.as_deref() == Some(font.as_str())
+                    let same_font_name = state.font_name.as_deref() == Some(font.as_str());
+                    (same_font_name, same_font_name && state.font_size == size)
                 };
-                if !same_font {
+                if !same_font_and_size {
                     // Flush Tj buffer before changing font — the buffer decodes bytes
                     // using the font set at creation time, so a font change requires a
                     // new buffer to avoid decoding with the wrong ToUnicode CMap.
                     self.flush_tj_span_buffer()?;
 
-                    // Cache font reference for advance_position_for_string
-                    self.cached_current_font = self.fonts.get(&font).cloned();
+                    if !same_font_name {
+                        // Cache font reference and current-font tight metrics together.
+                        self.set_cached_current_font(self.fonts.get(&font).cloned());
+                    }
 
                     let state = self.state_stack.current_mut();
                     state.font_name = Some(font);
@@ -3813,25 +3783,24 @@ impl<'doc> TextExtractor<'doc> {
                 // If the new Tm is on the same line with the same transform,
                 // keep accumulating into the existing buffer instead of flushing
                 // (avoids creating thousands of 1-char TextSpans per page).
-                // When merge_tm_tj_runs is false, every Tm always starts a fresh span.
                 let is_continuation = self.merging_config.merge_tm_tj_runs
                     && match self.tj_span_buffer {
-                        Some(ref mut buffer)
-                            if !buffer.is_empty()
-                                && f.round() as i32 == buffer.start_matrix.f.round() as i32
-                                && a == buffer.start_matrix.a
-                                && b == buffer.start_matrix.b
-                                && c == buffer.start_matrix.c
-                                && d == buffer.start_matrix.d
-                                && e >= buffer.start_matrix.e =>
-                        {
-                            // Same line, same transform, LTR progression →
-                            // update width to reflect actual visual extent
-                            buffer.accumulated_width = e - buffer.start_matrix.e;
-                            true
-                        },
-                        _ => false,
-                    };
+                    Some(ref mut buffer)
+                        if !buffer.is_empty()
+                            && f.round() as i32 == buffer.start_matrix.f.round() as i32
+                            && a == buffer.start_matrix.a
+                            && b == buffer.start_matrix.b
+                            && c == buffer.start_matrix.c
+                            && d == buffer.start_matrix.d
+                            && e >= buffer.start_matrix.e =>
+                    {
+                        // Same line, same transform, LTR progression →
+                        // update width to reflect actual visual extent
+                        buffer.accumulated_width = e - buffer.start_matrix.e;
+                        true
+                    },
+                    _ => false,
+                };
 
                 if !is_continuation {
                     self.flush_tj_span_buffer()?;
@@ -3908,9 +3877,10 @@ impl<'doc> TextExtractor<'doc> {
                             buffer.unicode.push_str(&actual_text);
                         }
                     } else {
-                        // Character mode: show_text maps through font, but ActualText
-                        // is already decoded. Fall back to show_text for positioning.
-                        self.show_text(actual_text.as_bytes())?;
+                        // Character mode must emit the already-decoded Unicode directly.
+                        // Re-feeding UTF-8 bytes through show_text() corrupts text such
+                        // as U+00A0 into multiple PDF-font byte codes (e.g. "Â ").
+                        self.emit_actual_text_chars(&actual_text, &text)?;
                     }
 
                     // Advance position for the original text (to maintain layout)
@@ -3968,8 +3938,10 @@ impl<'doc> TextExtractor<'doc> {
                         buffer.unicode.push_str(&actual_text);
                         self.flush_tj_buffer(buffer)?;
                     } else {
-                        // Character mode: fall back to show_text for positioning
-                        self.show_text(actual_text.as_bytes())?;
+                        self.emit_actual_text_chars(
+                            &actual_text,
+                            &collect_tj_string_bytes(array.as_slice()),
+                        )?;
                     }
 
                     // Advance position for the entire TJ array (to maintain layout)
@@ -3996,118 +3968,7 @@ impl<'doc> TextExtractor<'doc> {
                         // This creates one span per logical text unit instead of fragmenting
                         self.process_tj_array(&array)?;
                     } else {
-                        // Keep old behavior for character extraction mode
-                        for element in array {
-                            match element {
-                                TextElement::String(s) => {
-                                    self.show_text(&s)?;
-                                },
-                                TextElement::Offset(offset) => {
-                                    // Adjust text position by offset (in thousandths of em)
-                                    let state = self.state_stack.current();
-                                    let tx = -offset / 1000.0
-                                        * state.font_size
-                                        * state.horizontal_scaling
-                                        / 100.0;
-
-                                    // HEURISTIC: Insert space character for significant negative offsets
-                                    //
-                                    // PDF Spec Reference: ISO 32000-1:2008, Section 9.4.4
-                                    // The spec defines text positioning but does NOT specify when a positioning
-                                    // offset represents a word boundary vs. tight kerning.
-                                    //
-                                    // In PDFs, spaces are often represented as negative positioning offsets in TJ arrays,
-                                    // not as explicit space characters. For example:
-                                    // [(Text1) -200 (Text2)] TJ  <- the -200 creates visual spacing
-                                    //
-                                    // Geometry-based adaptive threshold (based on font metrics)
-                                    // Formula: adaptive_threshold = -(average_glyph_width * word_margin_ratio)
-                                    // This adapts to different font sizes and families.
-                                    // Fallback: static threshold if font unavailable or adaptive disabled.
-                                    let threshold = self.calculate_adaptive_tj_threshold();
-                                    if offset < threshold {
-                                        let text_matrix = state.text_matrix;
-                                        let ctm = state.ctm;
-                                        let font_name = state.font_name.clone();
-                                        let font_size = state.font_size;
-                                        let fill_color_rgb = state.fill_color_rgb;
-
-                                        // Calculate effective font size (accounting for CTM and text matrix scaling)
-                                        let combined = ctm.multiply(&text_matrix);
-                                        let effective_font_size = font_size
-                                            * (combined.d * combined.d + combined.b * combined.b)
-                                                .sqrt();
-
-                                        // Get font for determining weight
-                                        let font = font_name
-                                            .as_ref()
-                                            .and_then(|name| self.fonts.get(name));
-                                        let font_weight = if let Some(font) = font {
-                                            if font.is_bold() {
-                                                FontWeight::Bold
-                                            } else {
-                                                FontWeight::Normal
-                                            }
-                                        } else {
-                                            FontWeight::Normal
-                                        };
-
-                                        // Create space character at current position
-                                        // Apply CTM to get position in user space
-                                        let text_pos = text_matrix.transform_point(0.0, 0.0);
-                                        let pos = ctm.transform_point(text_pos.x, text_pos.y);
-                                        let (r, g, b) = fill_color_rgb;
-                                        let is_italic_space = font_name
-                                            .as_ref()
-                                            .and_then(|name| self.fonts.get(name))
-                                            .map(|font| font.is_italic())
-                                            .unwrap_or(false);
-                                        let font_name_str = font_name.unwrap_or_default();
-                                        // Compose CTM and text_matrix for full transformation
-                                        let final_matrix = ctm.multiply(&text_matrix);
-                                        // Calculate rotation from matrix: atan2(b, a)
-                                        let rotation_degrees =
-                                            final_matrix.b.atan2(final_matrix.a).to_degrees();
-
-                                        let space_char = TextChar {
-                                            char: ' ',
-                                            bbox: Rect::new(
-                                                pos.x,               // X position in user space
-                                                pos.y,               // Y position in user space
-                                                tx.abs(), // Width = the gap being created
-                                                effective_font_size, // Height = effective font size
-                                            ),
-                                            font_name: font_name_str,
-                                            font_size: effective_font_size,
-                                            font_weight,
-                                            color: Color::new(r, g, b),
-                                            mcid: self.current_mcid,
-                                            is_italic: is_italic_space,
-                                            is_monospace: false,
-                                            // Transformation properties (v0.3.1)
-                                            origin_x: pos.x,
-                                            origin_y: pos.y,
-                                            rotation_degrees,
-                                            advance_width: tx.abs(),
-                                            matrix: Some([
-                                                final_matrix.a,
-                                                final_matrix.b,
-                                                final_matrix.c,
-                                                final_matrix.d,
-                                                final_matrix.e,
-                                                final_matrix.f,
-                                            ]),
-                                        };
-                                        self.chars.push(space_char);
-                                    }
-
-                                    let state_mut = self.state_stack.current_mut();
-                                    let tm = state_mut.text_matrix;
-                                    state_mut.text_matrix.e += tx * tm.a;
-                                    state_mut.text_matrix.f += tx * tm.b;
-                                },
-                            }
-                        }
+                        self.process_tj_array_chars(&array)?;
                     }
                 }
             },
@@ -4198,14 +4059,8 @@ impl<'doc> TextExtractor<'doc> {
             },
             Operator::RestoreState => {
                 self.state_stack.restore();
-                // Sync cached font with restored state
-                self.cached_current_font = self
-                    .state_stack
-                    .current()
-                    .font_name
-                    .as_ref()
-                    .and_then(|name| self.fonts.get(name))
-                    .cloned();
+                // Sync cached font and current-font tight metrics with restored state.
+                self.sync_cached_current_font_from_state();
             },
             Operator::Cm { a, b, c, d, e, f } => {
                 let state = self.state_stack.current_mut();
@@ -4336,36 +4191,9 @@ impl<'doc> TextExtractor<'doc> {
                         log::debug!("DeviceN color space using simplified conversion");
                     },
                     _ => {
-                        // Named color space reference (e.g. "Cs1") or unknown —
-                        // fall back by component count to avoid warn spam.
-                        match components.len() {
-                            1 => {
-                                let gray = components[0];
-                                state.fill_color_rgb = (gray, gray, gray);
-                            },
-                            3 => {
-                                state.fill_color_rgb =
-                                    (components[0], components[1], components[2]);
-                            },
-                            4 => {
-                                state.fill_color_cmyk = Some((
-                                    components[0],
-                                    components[1],
-                                    components[2],
-                                    components[3],
-                                ));
-                                state.fill_color_rgb = cmyk_to_rgb(
-                                    components[0],
-                                    components[1],
-                                    components[2],
-                                    components[3],
-                                );
-                            },
-                            _ => {},
-                        }
-                        log::debug!(
-                            "Unknown fill color space {:?} with {} components; \
-                             applied component-count fallback",
+                        // Unknown or unsupported color space - use default black
+                        log::warn!(
+                            "Unsupported fill color space: {} with {} components",
                             state.fill_color_space,
                             components.len()
                         );
@@ -4435,34 +4263,9 @@ impl<'doc> TextExtractor<'doc> {
                         log::debug!("DeviceN stroke color using simplified conversion");
                     },
                     _ => {
-                        match components.len() {
-                            1 => {
-                                let gray = components[0];
-                                state.stroke_color_rgb = (gray, gray, gray);
-                            },
-                            3 => {
-                                state.stroke_color_rgb =
-                                    (components[0], components[1], components[2]);
-                            },
-                            4 => {
-                                state.stroke_color_cmyk = Some((
-                                    components[0],
-                                    components[1],
-                                    components[2],
-                                    components[3],
-                                ));
-                                state.stroke_color_rgb = cmyk_to_rgb(
-                                    components[0],
-                                    components[1],
-                                    components[2],
-                                    components[3],
-                                );
-                            },
-                            _ => {},
-                        }
-                        log::debug!(
-                            "Unknown stroke color space {:?} with {} components; \
-                             applied component-count fallback",
+                        // Unknown or unsupported color space
+                        log::warn!(
+                            "Unsupported stroke color space: {} with {} components",
                             state.stroke_color_space,
                             components.len()
                         );
@@ -4546,34 +4349,8 @@ impl<'doc> TextExtractor<'doc> {
                             }
                         },
                         _ => {
-                            match components.len() {
-                                1 => {
-                                    let gray = components[0];
-                                    state.fill_color_rgb = (gray, gray, gray);
-                                },
-                                3 => {
-                                    state.fill_color_rgb =
-                                        (components[0], components[1], components[2]);
-                                },
-                                4 => {
-                                    state.fill_color_cmyk = Some((
-                                        components[0],
-                                        components[1],
-                                        components[2],
-                                        components[3],
-                                    ));
-                                    state.fill_color_rgb = cmyk_to_rgb(
-                                        components[0],
-                                        components[1],
-                                        components[2],
-                                        components[3],
-                                    );
-                                },
-                                _ => {},
-                            }
-                            log::debug!(
-                                "Unknown fill color space {:?} with {} components; \
-                                 applied component-count fallback",
+                            log::warn!(
+                                "Unsupported fill color space: {} with {} components",
                                 state.fill_color_space,
                                 components.len()
                             );
@@ -4658,34 +4435,8 @@ impl<'doc> TextExtractor<'doc> {
                             }
                         },
                         _ => {
-                            match components.len() {
-                                1 => {
-                                    let gray = components[0];
-                                    state.stroke_color_rgb = (gray, gray, gray);
-                                },
-                                3 => {
-                                    state.stroke_color_rgb =
-                                        (components[0], components[1], components[2]);
-                                },
-                                4 => {
-                                    state.stroke_color_cmyk = Some((
-                                        components[0],
-                                        components[1],
-                                        components[2],
-                                        components[3],
-                                    ));
-                                    state.stroke_color_rgb = cmyk_to_rgb(
-                                        components[0],
-                                        components[1],
-                                        components[2],
-                                        components[3],
-                                    );
-                                },
-                                _ => {},
-                            }
-                            log::debug!(
-                                "Unknown stroke color space {:?} with {} components; \
-                                 applied component-count fallback",
+                            log::warn!(
+                                "Unsupported stroke color space: {} with {} components",
                                 state.stroke_color_space,
                                 components.len()
                             );
@@ -4932,10 +4683,11 @@ impl<'doc> TextExtractor<'doc> {
             None => return Ok(None),
         };
 
-        let doc = match self.document {
-            Some(d) => d,
+        let doc_ptr = match self.document {
+            Some(ptr) => ptr,
             None => return Ok(None),
         };
+        let doc = unsafe { &*doc_ptr };
 
         // Resolve resources → XObject dict
         let resources_obj = if let Some(res_ref) = resources.as_reference() {
@@ -4990,25 +4742,7 @@ impl<'doc> TextExtractor<'doc> {
             None => return Ok(()),
         };
 
-        // Build a CTM-aware deduplication key.
-        //
-        // Using just `xobject_ref` as the key incorrectly blocked re-processing
-        // the same Form XObject when it was invoked a second time on the same page
-        // with a different CTM (e.g., same header/footer XObject stamped at two
-        // different Y positions, or the nougat_005 pattern where each page's
-        // content stream sets a different `cm` translation before calling `Do`).
-        //
-        // The CTM is encoded as 6 millipoint-rounded i64 values so it can be
-        // stored in a HashSet without floating-point equality hazards.
-        // Infinite-recursion cycles are still prevented because a truly recursive
-        // call re-enters with the *same* XObject ref AND the same CTM at that
-        // nesting depth; the depth limiter (MAX_XOBJECT_DEPTH) provides a
-        // second backstop.
         let current_ctm = self.state_stack.current().ctm;
-        // Round to nearest millipoint instead of truncating with `as i64`,
-        // so floating-point noise in the same logical CTM produces a
-        // stable hash key (truncation alone could send 0.99999... and
-        // 1.00001... to different buckets).
         let ctm_key = [
             (current_ctm.a * 1000.0).round() as i64,
             (current_ctm.b * 1000.0).round() as i64,
@@ -5019,17 +4753,17 @@ impl<'doc> TextExtractor<'doc> {
         ];
         let xobj_key = (xobject_ref, ctm_key);
 
-        // Skip already-processed (XObject, CTM) pairs — each unique combination
-        // is processed at most once per page for text extraction.
+        // Skip already-processed (XObject, CTM) pairs so repeated placements
+        // on the same page still extract independently.
         if self.processed_xobjects.contains(&xobj_key) {
             return Ok(());
         }
 
         self.processed_xobjects.insert(xobj_key);
 
-        // Get document reference for loading objects.
+        // Get document reference for loading objects
         let doc = match self.document {
-            Some(d) => d,
+            Some(ptr) => unsafe { &*ptr },
             None => return Ok(()),
         };
 
@@ -5049,16 +4783,9 @@ impl<'doc> TextExtractor<'doc> {
             return Ok(());
         }
 
-        // Span result cache: reuse extracted spans from self-contained Form XObjects.
-        //
-        // The cache key is (ObjectRef, ctm_key) where ctm_key encodes the caller's
-        // CTM as 6 millipoint-rounded i64 values. This allows the same Form XObject
-        // to have independent cached results for each unique CTM it is painted with,
-        // fixing the issue where cross-page reuse of a single Form XObject with
-        // different per-page CTM translations returned stale page-0 coordinates on
-        // all subsequent pages (nougat_005.pdf, Issue B1).
-        //
-        // `ctm_key` was already computed above for the `processed_xobjects` guard.
+        // Cache span extraction by (XObject ref, caller CTM). The cached spans are
+        // already in page coordinates after CTM application, so the CTM must be part
+        // of the key to avoid reusing stale coordinates across placements.
         let spans_cache_key = (xobject_ref, ctm_key);
         if self.extract_spans {
             let cached_spans = {
@@ -5278,17 +5005,8 @@ impl<'doc> TextExtractor<'doc> {
                     );
                 }
 
-                // Cache span results for self-contained Form XObjects.
-                //
-                // The cache key `spans_cache_key` already encodes (ObjectRef, ctm_key),
-                // so each unique (XObject, CTM) pair gets its own entry. There is no
-                // longer any need to restrict caching to identity-CTM invocations —
-                // different CTMs produce different cache entries and therefore cannot
-                // pollute each other (this was the root cause of issue B1).
-                //
-                // We still require `has_own_resources` so that font lookups are
-                // self-contained; XObjects that inherit page-level fonts would
-                // produce spans whose glyph mappings depend on caller context.
+                // Cache span results for self-contained Form XObjects. The key already
+                // includes the caller CTM, so different placements no longer collide.
                 if has_own_resources && self.extract_spans {
                     let new_spans = if self.spans.len() > spans_before {
                         Some(self.spans[spans_before..].to_vec())
@@ -5303,14 +5021,8 @@ impl<'doc> TextExtractor<'doc> {
 
                 // Restore graphics state (implicit Q per ISO 32000-1 §8.10.1)
                 self.state_stack.restore();
-                // Sync cached font with restored state
-                self.cached_current_font = self
-                    .state_stack
-                    .current()
-                    .font_name
-                    .as_ref()
-                    .and_then(|name| self.fonts.get(name))
-                    .cloned();
+                // Sync cached font and current-font tight metrics with restored state.
+                self.sync_cached_current_font_from_state();
 
                 // Restore fonts, resources, and XObject cache only if saved
                 if let Some(fonts) = saved_fonts {
@@ -5378,6 +5090,7 @@ impl<'doc> TextExtractor<'doc> {
         // RTL text correction: if text contains RTL characters and spans left-to-right
         // on the page, the characters are in visual LTR order. Reverse to logical order.
         let mut text = std::mem::take(&mut buffer.unicode);
+        let mut char_widths = std::mem::take(&mut buffer.char_widths);
         if text.len() > 1 {
             let has_rtl = text
                 .chars()
@@ -5390,18 +5103,21 @@ impl<'doc> TextExtractor<'doc> {
                 // Only reverse if user_pos_x indicates LTR placement (positive width).
                 if buffer.accumulated_width > 0.0 {
                     text = text.chars().rev().collect();
+                    char_widths.reverse();
                 }
             }
         }
 
+        let span_bbox = Rect {
+            x: buffer.user_pos_x,
+            y: buffer.user_pos_y,
+            width: total_width,
+            height: effective_font_size,
+        };
+
         let span = TextSpan {
             text,
-            bbox: Rect {
-                x: buffer.user_pos_x,
-                y: buffer.user_pos_y,
-                width: total_width,
-                height: effective_font_size,
-            },
+            bbox: span_bbox,
             font_name: font_name_span,
             font_size: effective_font_size,
             font_weight,
@@ -5422,7 +5138,7 @@ impl<'doc> TextExtractor<'doc> {
             primary_detected: false,
             artifact_type: self.current_artifact_type(),
             char_widths: {
-                let mut cw = std::mem::take(&mut buffer.char_widths);
+                let mut cw = char_widths;
                 let h = buffer.user_h_scale;
                 for w in &mut cw {
                     *w *= h;
@@ -6033,11 +5749,15 @@ impl<'doc> TextExtractor<'doc> {
                 }
                 w_sum
             } else {
-                // Type0/CID font: use TextCharIter so that the byte-width (1 or 2)
-                // is determined by the font's encoding / ToUnicode CMap codespace,
-                // not hardcoded to 2.  Per ISO 32000-1:2008 §9.7.6.2.
+                // Type0/CID font: process 2-byte CID codes (Identity-H encoding)
+                // Per ISO 32000-1:2008 Section 9.7.6.2, composite fonts use multi-byte codes
                 let mut w_sum = 0.0f32;
-                for (cid, _) in TextCharIter::new(text, Some(font)) {
+                for chunk in text.chunks(2) {
+                    let cid = if chunk.len() == 2 {
+                        ((chunk[0] as u16) << 8) | (chunk[1] as u16)
+                    } else {
+                        chunk[0] as u16
+                    };
                     let mut w = font.get_glyph_width(cid) * fs_factor * hs_factor;
                     w += cs_hs;
                     // Per ISO 32000-1:2008 Section 9.3.3: Tw applied when CID == 32
@@ -6157,19 +5877,15 @@ impl<'doc> TextExtractor<'doc> {
                         // Rare: multi-char mapping or unmapped byte
                         if let Some(s) = font.char_to_unicode(byte as u32) {
                             if s != "\u{FFFD}" {
-                                for ch in s.chars() {
-                                    if ch >= '\x20' || ch == '\t' || ch == '\n' || ch == '\r' {
-                                        buffer.unicode.push(ch);
-                                    }
+                                for ch in s.chars().filter_map(sanitize_extracted_unicode_char) {
+                                    buffer.unicode.push(ch);
                                 }
                             }
                         } else {
                             let fb = fallback_char_to_unicode(byte as u32);
                             if fb != "\u{FFFD}" {
-                                for ch in fb.chars() {
-                                    if ch >= '\x20' || ch == '\t' || ch == '\n' || ch == '\r' {
-                                        buffer.unicode.push(ch);
-                                    }
+                                for ch in fb.chars().filter_map(sanitize_extracted_unicode_char) {
+                                    buffer.unicode.push(ch);
                                 }
                             }
                         }
@@ -6337,19 +6053,15 @@ impl<'doc> TextExtractor<'doc> {
                         buffer.unicode.push(c);
                     } else if let Some(s) = font.char_to_unicode(byte as u32) {
                         if s != "\u{FFFD}" {
-                            for ch in s.chars() {
-                                if ch >= '\x20' || ch == '\t' || ch == '\n' || ch == '\r' {
-                                    buffer.unicode.push(ch);
-                                }
+                            for ch in s.chars().filter_map(sanitize_extracted_unicode_char) {
+                                buffer.unicode.push(ch);
                             }
                         }
                     } else {
                         let fb = fallback_char_to_unicode(byte as u32);
                         if fb != "\u{FFFD}" {
-                            for ch in fb.chars() {
-                                if ch >= '\x20' || ch == '\t' || ch == '\n' || ch == '\r' {
-                                    buffer.unicode.push(ch);
-                                }
+                            for ch in fb.chars().filter_map(sanitize_extracted_unicode_char) {
+                                buffer.unicode.push(ch);
                             }
                         }
                     }
@@ -6372,13 +6084,14 @@ impl<'doc> TextExtractor<'doc> {
                 w_sum
             } else {
                 buffer.append(text)?;
-                // Width calculation: use TextCharIter so byte-width respects the
-                // CMap codespace (1 or 2 bytes per character).  Fixes CJK fonts
-                // whose encoding name doesn't match the well-known Identity-H/EUC/…
-                // keyword patterns but whose ToUnicode CMap declares a 2-byte
-                // codespace range (§9.7.5).
+                // Width calculation: process 2-byte CID codes (Identity-H encoding)
                 let mut w_sum = 0.0f32;
-                for (cid, _) in TextCharIter::new(text, Some(font)) {
+                for chunk in text.chunks(2) {
+                    let cid = if chunk.len() == 2 {
+                        ((chunk[0] as u16) << 8) | (chunk[1] as u16)
+                    } else {
+                        chunk[0] as u16
+                    };
                     let mut w = font.get_glyph_width(cid) * fs_factor * hs_factor;
                     w += cs_hs;
                     if cid == 32 {
@@ -6418,7 +6131,7 @@ impl<'doc> TextExtractor<'doc> {
         let font_size = state.font_size;
         let text_matrix = state.text_matrix;
         let ctm = state.ctm;
-        let combined = ctm.multiply(&text_matrix);
+        let combined = text_matrix.multiply(&ctm);
         let effective_font_size =
             font_size * (combined.d * combined.d + combined.b * combined.b).sqrt();
         let word_space = state.word_space;
@@ -6491,6 +6204,23 @@ impl<'doc> TextExtractor<'doc> {
         Ok(())
     }
 
+    fn process_tj_array_chars(&mut self, array: &[TextElement]) -> Result<()> {
+        for element in array.iter() {
+            match element {
+                TextElement::String(s) => self.show_text(s)?,
+                TextElement::Offset(offset) => {
+                    if self.tj_offset_history.len() < 10000 {
+                        self.tj_offset_history.push(*offset);
+                    }
+
+                    self.advance_position_for_offset(*offset)?;
+                },
+            }
+        }
+
+        Ok(())
+    }
+
     /// Advance text position for a TJ offset value.
     fn advance_position_for_offset(&mut self, offset: f32) -> Result<()> {
         let state = self.state_stack.current();
@@ -6532,14 +6262,17 @@ impl<'doc> TextExtractor<'doc> {
                     .font_name
                     .take()
                     .unwrap_or_else(|| "Unknown".to_string());
+                let text = std::mem::take(&mut buffer.unicode);
+                let char_widths = std::mem::take(&mut buffer.char_widths);
+                let span_bbox = Rect {
+                    x: buffer.user_pos_x,
+                    y: buffer.user_pos_y,
+                    width: total_width,
+                    height: effective_font_size,
+                };
                 let span = TextSpan {
-                    text: std::mem::take(&mut buffer.unicode),
-                    bbox: Rect {
-                        x: buffer.user_pos_x,
-                        y: buffer.user_pos_y,
-                        width: total_width,
-                        height: effective_font_size,
-                    },
+                    text,
+                    bbox: span_bbox,
                     font_name: font_name_buf,
                     font_size: effective_font_size,
                     font_weight,
@@ -6560,7 +6293,7 @@ impl<'doc> TextExtractor<'doc> {
                     primary_detected: false,
                     artifact_type: None,
                     char_widths: {
-                        let mut cw = std::mem::take(&mut buffer.char_widths);
+                        let mut cw = char_widths;
                         let h = buffer.user_h_scale;
                         for w in &mut cw {
                             *w *= h;
@@ -6586,6 +6319,165 @@ impl<'doc> TextExtractor<'doc> {
         Ok(())
     }
 
+    fn emit_actual_text_chars(&mut self, actual_text: &str, source_text: &[u8]) -> Result<()> {
+        let source_text = if source_text.len() > 32_767 {
+            &source_text[..32_767]
+        } else {
+            source_text
+        };
+
+        let decoded_chars: Vec<char> = actual_text
+            .chars()
+            .filter_map(sanitize_extracted_unicode_char)
+            .collect();
+        if decoded_chars.is_empty() {
+            return Ok(());
+        }
+
+        let state = self.state_stack.current();
+        let text_matrix = state.text_matrix;
+        let font_size = state.font_size;
+        let horizontal_scaling = state.horizontal_scaling;
+        let char_space = state.char_space;
+        let word_space = state.word_space;
+        let fill_color_rgb = state.fill_color_rgb;
+        let ctm = state.ctm;
+        let fs_factor = font_size / 1000.0;
+        let hs_factor = horizontal_scaling / 100.0;
+        let cs_hs = char_space * hs_factor;
+        let ws_hs = word_space * hs_factor;
+
+        let font = self.cached_current_font.clone();
+        let font_ref = font.as_deref();
+        let source_metrics: Vec<(u32, f32, f32)> = if let Some(font) = font_ref {
+            if font.subtype != "Type0" {
+                let width_table = font.get_byte_to_width_table();
+                source_text
+                    .iter()
+                    .map(|&byte| {
+                        let glyph_width = width_table[byte as usize] * fs_factor * hs_factor;
+                        let mut advance = glyph_width + cs_hs;
+                        if byte == 0x20 {
+                            advance += ws_hs;
+                        }
+                        (byte as u32, advance, glyph_width)
+                    })
+                    .collect()
+            } else {
+                TextCharIter::new(source_text, Some(font))
+                    .map(|(char_code, _)| {
+                        let glyph_width = font.get_glyph_width(char_code) * fs_factor * hs_factor;
+                        let mut advance = glyph_width + cs_hs;
+                        if char_code == 32 {
+                            advance += ws_hs;
+                        }
+                        (char_code as u32, advance, glyph_width)
+                    })
+                    .collect()
+            }
+        } else {
+            source_text
+                .iter()
+                .map(|&byte| {
+                    let glyph_width = 500.0 * fs_factor * hs_factor;
+                    let mut advance = glyph_width + cs_hs;
+                    if byte == 0x20 {
+                        advance += ws_hs;
+                    }
+                    (byte as u32, advance, glyph_width)
+                })
+                .collect()
+        };
+
+        let total_advance: f32 = source_metrics.iter().map(|(_, advance, _)| *advance).sum();
+        let default_advance = total_advance / decoded_chars.len() as f32;
+
+        let combined_char = text_matrix.multiply(&ctm);
+        let effective_font_size = font_size
+            * (combined_char.d * combined_char.d + combined_char.b * combined_char.b).sqrt();
+        let duplicate_threshold = 0.07 * effective_font_size.max(1.0);
+
+        let (font_weight, is_italic_char) = if let Some(font) = font_ref {
+            (
+                if font.is_bold() {
+                    FontWeight::Bold
+                } else {
+                    FontWeight::Normal
+                },
+                font.is_italic(),
+            )
+        } else {
+            (FontWeight::Normal, false)
+        };
+
+        let (r, g, b) = fill_color_rgb;
+        let color = Color::new(r, g, b);
+        let final_matrix = text_matrix.multiply(&ctm);
+        let rotation_degrees = final_matrix.b.atan2(final_matrix.a).to_degrees();
+        let font_ref = font.as_deref();
+
+        let source_len_matches = source_metrics.len() == decoded_chars.len();
+        let mut x_offset_user = 0.0;
+        for (index, unicode_char) in decoded_chars.into_iter().enumerate() {
+            let char_code = if source_len_matches {
+                source_metrics[index].0
+            } else {
+                source_metrics
+                    .get(index)
+                    .or_else(|| source_metrics.last())
+                    .map(|(char_code, _, _)| *char_code)
+                    .unwrap_or(unicode_char as u32)
+            };
+            let advance_for_char = if source_len_matches {
+                source_metrics[index].1
+            } else {
+                default_advance
+            };
+            let char_origin = final_matrix.transform_point(x_offset_user, 0.0);
+            let next_origin = final_matrix.transform_point(x_offset_user + advance_for_char, 0.0);
+            let advance_width = ((next_origin.x - char_origin.x).powi(2)
+                + (next_origin.y - char_origin.y).powi(2))
+            .sqrt();
+
+            let bbox = self.coarse_char_bbox(
+                char_origin.x,
+                char_origin.y,
+                advance_width,
+                effective_font_size,
+            );
+
+            let text_char = TextChar {
+                char: unicode_char,
+                bbox,
+                font_name: font_ref.map(|f| f.base_font.clone()).unwrap_or_default(),
+                font_size: effective_font_size,
+                font_weight,
+                color,
+                mcid: self.current_mcid,
+                is_italic: is_italic_char,
+                is_monospace: false,
+                origin_x: char_origin.x,
+                origin_y: char_origin.y,
+                rotation_degrees,
+                advance_width,
+                matrix: Some([
+                    final_matrix.a,
+                    final_matrix.b,
+                    final_matrix.c,
+                    final_matrix.d,
+                    char_origin.x,
+                    char_origin.y,
+                ]),
+            };
+
+            self.push_extracted_char(text_char, char_code, duplicate_threshold);
+
+            x_offset_user += advance_for_char;
+        }
+
+        Ok(())
+    }
+
     fn show_text(&mut self, text: &[u8]) -> Result<()> {
         // PDF spec Section 7.3.4.2: implementation limit of 32,767 bytes per string.
         let text = if text.len() > 32_767 {
@@ -6608,34 +6500,24 @@ impl<'doc> TextExtractor<'doc> {
         let ctm = state.ctm;
 
         // Get current font from cached reference
-        let font = self.cached_current_font.as_deref();
+        let font = self.cached_current_font.clone();
+        let font_ref = font.as_deref();
 
-        for (char_code, _) in TextCharIter::new(text, font) {
+        for (char_code, _) in TextCharIter::new(text, font_ref) {
             // Get current text matrix (may be updated by previous characters in this string)
             let state = self.state_stack.current();
             let text_matrix = state.text_matrix;
-
             // Get Unicode string using font mapping
-            let unicode_string = if let Some(font) = font {
-                font.char_to_unicode(char_code as u32)
-                    .unwrap_or_else(|| fallback_char_to_unicode(char_code as u32))
-            } else if char_code < 256 && (char_code as u8).is_ascii() {
-                (char_code as u8 as char).to_string()
-            } else {
-                "?".to_string()
-            };
-
-            // Calculate character position in user space
-            let text_pos = text_matrix.transform_point(0.0, 0.0);
-            let pos = ctm.transform_point(text_pos.x, text_pos.y);
+            let unicode_string = self.resolve_unicode_string(font_ref, char_code as u32);
 
             // Calculate effective font size
-            let combined_char = ctm.multiply(&text_matrix);
+            let combined_char = text_matrix.multiply(&ctm);
             let effective_font_size = font_size
                 * (combined_char.d * combined_char.d + combined_char.b * combined_char.b).sqrt();
+            let duplicate_threshold = 0.07 * effective_font_size.max(1.0);
 
             // Calculate character dimensions using accurate glyph width
-            let glyph_width_font_units = if let Some(font) = font {
+            let glyph_width_font_units = if let Some(font) = font_ref {
                 font.get_glyph_width(char_code)
             } else {
                 500.0 // Default 0.5em
@@ -6645,12 +6527,8 @@ impl<'doc> TextExtractor<'doc> {
             let hs_factor = horizontal_scaling / 100.0;
             let glyph_width_user_space = glyph_width_font_units * fs_factor * hs_factor;
 
-            // For TextChar, we use the device-space width
-            let glyph_width_device_space = glyph_width_user_space * combined_char.a.abs();
-            let height_device_space = effective_font_size;
-
             // Determine font weight and style
-            let (font_weight, is_italic_char) = if let Some(font) = font {
+            let (font_weight, is_italic_char) = if let Some(font) = font_ref {
                 (
                     if font.is_bold() {
                         FontWeight::Bold
@@ -6668,23 +6546,19 @@ impl<'doc> TextExtractor<'doc> {
             let color = Color::new(r, g, b);
 
             // Compose CTM and text_matrix for full transformation
-            let final_matrix = ctm.multiply(&text_matrix);
+            let final_matrix = text_matrix.multiply(&ctm);
             let rotation_degrees = final_matrix.b.atan2(final_matrix.a).to_degrees();
 
             // Guard against malformed fonts
-            let unicode_string = if unicode_string.chars().count() > 8 {
-                unicode_string.chars().next().unwrap_or('?').to_string()
-            } else {
-                unicode_string
-            };
+            let unicode_string =
+                sanitize_extracted_unicode_string(&if unicode_string.chars().count() > 8 {
+                    unicode_string.chars().next().unwrap_or('?').to_string()
+                } else {
+                    unicode_string
+                });
 
             // Process each character in the expanded string (ligatures)
             let char_count = unicode_string.chars().count();
-            let char_width_device = if char_count > 0 {
-                glyph_width_device_space / char_count as f32
-            } else {
-                glyph_width_device_space
-            };
             let char_width_user = if char_count > 0 {
                 glyph_width_user_space / char_count as f32
             } else {
@@ -6692,50 +6566,45 @@ impl<'doc> TextExtractor<'doc> {
             };
 
             for (char_index, unicode_char) in unicode_string.chars().enumerate() {
-                let should_skip = unicode_char == '\0'
-                    || (unicode_char.is_control()
-                        && unicode_char != '\t'
-                        && unicode_char != '\n'
-                        && unicode_char != '\r');
+                let x_offset_user = char_index as f32 * char_width_user;
+                let char_origin = final_matrix.transform_point(x_offset_user, 0.0);
+                let next_origin =
+                    final_matrix.transform_point(x_offset_user + char_width_user, 0.0);
+                let advance_width = ((next_origin.x - char_origin.x).powi(2)
+                    + (next_origin.y - char_origin.y).powi(2))
+                .sqrt();
+                let bbox = self.coarse_char_bbox(
+                    char_origin.x,
+                    char_origin.y,
+                    advance_width,
+                    effective_font_size,
+                );
 
-                if !should_skip {
-                    let x_offset_device = char_index as f32 * char_width_device;
-                    let x_offset_user = char_index as f32 * char_width_user;
+                let text_char = TextChar {
+                    char: unicode_char,
+                    bbox,
+                    font_name: font_ref.map(|f| f.base_font.clone()).unwrap_or_default(),
+                    font_size: effective_font_size,
+                    font_weight,
+                    color,
+                    mcid: self.current_mcid,
+                    is_italic: is_italic_char,
+                    is_monospace: false,
+                    origin_x: char_origin.x,
+                    origin_y: char_origin.y,
+                    rotation_degrees,
+                    advance_width,
+                    matrix: Some([
+                        final_matrix.a,
+                        final_matrix.b,
+                        final_matrix.c,
+                        final_matrix.d,
+                        char_origin.x,
+                        char_origin.y,
+                    ]),
+                };
 
-                    let char_origin_x = pos.x + x_offset_device;
-                    let char_origin_y = pos.y;
-
-                    let text_char = TextChar {
-                        char: unicode_char,
-                        bbox: Rect::new(
-                            char_origin_x,
-                            char_origin_y,
-                            char_width_device,
-                            height_device_space,
-                        ),
-                        font_name: font.map(|f| f.base_font.clone()).unwrap_or_default(),
-                        font_size: effective_font_size,
-                        font_weight,
-                        color,
-                        mcid: self.current_mcid,
-                        is_italic: is_italic_char,
-                        is_monospace: false,
-                        origin_x: char_origin_x,
-                        origin_y: char_origin_y,
-                        rotation_degrees,
-                        advance_width: char_width_device,
-                        matrix: Some([
-                            final_matrix.a,
-                            final_matrix.b,
-                            final_matrix.c,
-                            final_matrix.d,
-                            final_matrix.e + x_offset_user,
-                            final_matrix.f,
-                        ]),
-                    };
-
-                    self.chars.push(text_char);
-                }
+                self.push_extracted_char(text_char, char_code as u32, duplicate_threshold);
             }
 
             // Advance position: Tx = (w0 * Tfs + Tc + Tw) * Th
@@ -6766,23 +6635,20 @@ impl<'doc> TextExtractor<'doc> {
     }
 }
 
-/// Convert DeviceCMYK to DeviceRGB per ISO 32000-1:2008 §10.3.5:
+/// Convert CMYK color to RGB color.
 ///
-///   R = 1 − min(1, C + K)
-///   G = 1 − min(1, M + K)
-///   B = 1 − min(1, Y + K)
+/// CMYK uses subtractive color model (for print), RGB uses additive (for screen).
+/// Conversion formula: R = 1 - min(1, C*(1-K) + K)
 ///
-/// Spec-mandated additive-clamp fallback for when no ICC profile drives
-/// the conversion. The multiplicative `(1-c)(1-k)` form is common in
-/// imaging libraries but is not what §10.3.5 specifies.
+/// PDF Spec: ISO 32000-1:2008, Section 8.6.4.4 - DeviceCMYK Color Space
 fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> (f32, f32, f32) {
-    let r = 1.0 - (c + k).min(1.0);
-    let g = 1.0 - (m + k).min(1.0);
-    let b = 1.0 - (y + k).min(1.0);
+    let r = 1.0 - (c * (1.0 - k) + k).min(1.0);
+    let g = 1.0 - (m * (1.0 - k) + k).min(1.0);
+    let b = 1.0 - (y * (1.0 - k) + k).min(1.0);
     (r, g, b)
 }
 
-impl<'doc> Default for TextExtractor<'doc> {
+impl Default for TextExtractor {
     fn default() -> Self {
         Self::new()
     }
@@ -7008,6 +6874,149 @@ mod tests {
         assert_eq!(chars[1].char, 'i');
     }
 
+    #[test]
+    fn test_extract_with_tj_array_does_not_double_insert_space_before_leading_whitespace() {
+        let config = TextExtractionConfig {
+            use_adaptive_tj_threshold: false,
+            space_insertion_threshold: -120.0,
+            ..TextExtractionConfig::default()
+        };
+        let mut extractor = TextExtractor::with_config(config);
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let stream = b"BT /F1 12 Tf 100 700 Td [(Hello) -500 ( World)] TJ ET";
+        let chars = extractor.extract(stream).unwrap();
+        let text: String = chars.iter().map(|ch| ch.char).collect();
+
+        assert_eq!(text, "Hello World");
+        assert_eq!(text.chars().filter(|&ch| ch == ' ').count(), 1);
+    }
+
+    #[test]
+    fn test_extract_with_tj_array_does_not_double_insert_space_after_trailing_whitespace() {
+        let config = TextExtractionConfig {
+            use_adaptive_tj_threshold: false,
+            space_insertion_threshold: -120.0,
+            ..TextExtractionConfig::default()
+        };
+        let mut extractor = TextExtractor::with_config(config);
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let stream = b"BT /F1 12 Tf 100 700 Td [(Hello ) -500 (World)] TJ ET";
+        let chars = extractor.extract(stream).unwrap();
+        let text: String = chars.iter().map(|ch| ch.char).collect();
+
+        assert_eq!(text, "Hello World");
+        assert_eq!(text.chars().filter(|&ch| ch == ' ').count(), 1);
+    }
+
+    #[test]
+    fn test_extract_with_tj_array_does_not_insert_synthetic_space_into_char_view() {
+        let config = TextExtractionConfig {
+            use_adaptive_tj_threshold: false,
+            space_insertion_threshold: -120.0,
+            ..TextExtractionConfig::default()
+        };
+        let mut extractor = TextExtractor::with_config(config);
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let stream = b"BT /F1 12 Tf 100 700 Td [(Hello) -500 (World)] TJ ET";
+        let chars = extractor.extract(stream).unwrap();
+        let text: String = chars.iter().map(|ch| ch.char).collect();
+
+        assert_eq!(text, "HelloWorld");
+        assert!(
+            chars.iter().all(|ch| ch.char != ' '),
+            "low-level char extraction should not synthesize TJ spaces"
+        );
+    }
+
+    #[test]
+    fn test_extract_does_not_synthesize_space_between_separate_text_runs_in_char_view() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let chars = extractor
+            .extract(b"BT /F1 12 Tf 100 700 Td (A) Tj 40 0 Td (B) Tj ET")
+            .unwrap();
+        let text = chars.iter().map(|ch| ch.char).collect::<String>();
+
+        assert_eq!(text, "AB");
+        assert!(
+            chars.iter().all(|ch| ch.char != ' '),
+            "low-level char extraction should not synthesize spaces across separate text runs"
+        );
+    }
+
+    #[test]
+    fn test_extract_collapses_consecutive_explicit_spaces_like_pdfium() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let chars = extractor
+            .extract(b"BT /F1 12 Tf 100 700 Td (A   B) Tj ET")
+            .unwrap();
+        let text = chars.iter().map(|ch| ch.char).collect::<String>();
+
+        assert_eq!(text, "A B");
+    }
+
+    #[test]
+    fn test_extract_suppresses_near_duplicate_glyphs_like_pdfium() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let chars = extractor
+            .extract(b"BT /F1 12 Tf 1 0 0 1 100 700 Tm (A) Tj 1 0 0 1 100 700 Tm (A) Tj ET")
+            .unwrap();
+        let text = chars.iter().map(|ch| ch.char).collect::<String>();
+
+        assert_eq!(text, "A");
+    }
+
+    #[test]
+    fn test_extract_collapses_consecutive_explicit_spaces_in_character_view() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let chars = extractor
+            .extract(b"BT /F1 12 Tf 100 700 Td (A  B) Tj ET")
+            .unwrap();
+
+        let text = chars.iter().map(|ch| ch.char).collect::<String>();
+        assert_eq!(text, "A B");
+    }
+
+    #[test]
+    fn test_control_char_mapping_still_emits_char_objects() {
+        let mut extractor = TextExtractor::new();
+        let mut font = create_test_font();
+        let mut custom = HashMap::new();
+        custom.insert(0x41u8, '\u{008F}');
+        font.encoding = Encoding::Custom(custom);
+        extractor.add_font("F1".to_string(), font);
+
+        let stream = b"BT /F1 12 Tf 100 700 Td (A) Tj ET";
+
+        let chars = extractor.extract(stream).expect("extract chars");
+        assert_eq!(
+            chars.len(),
+            1,
+            "visible glyphs whose Unicode mapping degrades to a control char should still emit a char object"
+        );
+        assert!(
+            chars[0].bbox.width > 0.0,
+            "emitted placeholder char should preserve a drawable bbox"
+        );
+    }
+
     /// Test extraction of multi-byte characters from Type0 fonts (Identity-H)
     /// This verifies the fix for Issue #186 where extract_chars() was garbling CJK text.
     #[test]
@@ -7127,6 +7136,77 @@ mod tests {
             spans3[0].is_monospace,
             "Font named DejaVuSansMono should be detected as monospace via name heuristic"
         );
+    }
+
+    #[test]
+    fn test_extract_chars_use_font_sized_boxes_for_standard_fonts() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let stream = b"BT /F1 12 Tf 100 700 Td (Ag) Tj ET";
+        let chars = extractor.extract(stream).unwrap();
+
+        assert_eq!(chars.len(), 2);
+
+        let uppercase = &chars[0];
+        assert_eq!(uppercase.char, 'A');
+        assert!(
+            (uppercase.bbox.height - uppercase.font_size).abs() < 0.01,
+            "bbox for 'A' should use the coarse font-sized box: bbox={:?}, font_size={}",
+            uppercase.bbox,
+            uppercase.font_size
+        );
+        assert!(
+            (uppercase.bbox.y - uppercase.origin_y).abs() < 0.01,
+            "coarse bbox for 'A' should start at the baseline origin: bbox={:?}, origin_y={}",
+            uppercase.bbox,
+            uppercase.origin_y
+        );
+
+        let descender = &chars[1];
+        assert_eq!(descender.char, 'g');
+        assert!(
+            (descender.bbox.height - descender.font_size).abs() < 0.01,
+            "bbox for 'g' should use the coarse font-sized box: bbox={:?}, font_size={}",
+            descender.bbox,
+            descender.font_size
+        );
+        assert!(
+            (descender.bbox.y - descender.origin_y).abs() < 0.01,
+            "coarse bbox for 'g' should start at the baseline origin: bbox={:?}, origin_y={}",
+            descender.bbox,
+            descender.origin_y
+        );
+    }
+
+    #[test]
+    fn test_extract_text_spans_preserve_character_widths() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let stream = b"BT /F1 12 Tf 100 700 Td (Ag) Tj ET";
+        let spans = extractor.extract_text_spans(stream).unwrap();
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text, "Ag");
+        assert!(!spans[0].char_widths.is_empty(), "span should preserve per-character widths");
+        assert_eq!(spans[0].bbox.y, 700.0);
+        assert_eq!(spans[0].bbox.height, 12.0);
+    }
+
+    #[test]
+    fn test_extract_chars_preserves_same_baseline_character_order_with_descenders() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let stream = b"BT /F1 12 Tf 100 700 Td (ga) Tj ET";
+        let chars = extractor.extract(stream).unwrap();
+        let text = chars.iter().map(|ch| ch.char).collect::<String>();
+
+        assert_eq!(text, "ga");
     }
 
     #[test]
@@ -8761,9 +8841,9 @@ mod tests {
             3,
             "Distinct characters close together must not be dropped"
         );
-        assert_eq!(extractor.chars[0].char, 't');
-        assert_eq!(extractor.chars[1].char, ' ');
-        assert_eq!(extractor.chars[2].char, 'r');
+        assert_eq!(extractor.chars.get(0).unwrap().char, 't');
+        assert_eq!(extractor.chars.get(1).unwrap().char, ' ');
+        assert_eq!(extractor.chars.get(2).unwrap().char, 'r');
     }
 
     #[test]
@@ -8792,77 +8872,18 @@ mod tests {
 
         extractor.deduplicate_overlapping_chars();
         assert_eq!(extractor.chars.len(), 1, "Duplicate same char should still be deduped");
-        assert_eq!(extractor.chars[0].char, 'A');
+        assert_eq!(extractor.chars.get(0).unwrap().char, 'A');
     }
 
     #[test]
-    fn test_deduplicate_keeps_narrow_glyph_doublets() {
-        // Regression: `ll`, `rr`, `II`, `ii` in small-font body text were
-        // wrongly collapsed to a single glyph because the dedup threshold
-        // was a hardcoded 2 pt — larger than the advance width of narrow
-        // glyphs at ≤ 9 pt in most fonts (Helvetica `l` ≈ 2.5 pt at 9 pt,
-        // smaller below). This caused visible corruption like
-        // `controller → controler` and `billed → biled`.
-        //
-        // Exercises the matrix of four narrow glyphs across three small
-        // body-text sizes. Advance widths are the real Helvetica per-em
-        // values (0.278 em for `l`/`i`, 0.333 em for `r`, 0.278 em for `I`).
-        let narrow_char = |c: char, x: f32, font_size: f32, advance_em: f32| TextChar {
-            char: c,
-            bbox: Rect::new(x, 700.0, advance_em * font_size * 0.6, font_size),
-            font_name: "Helvetica".to_string(),
-            font_size,
-            font_weight: FontWeight::Normal,
-            color: Color::black(),
-            mcid: None,
-            is_italic: false,
-            is_monospace: false,
-            origin_x: x,
-            origin_y: 700.0,
-            rotation_degrees: 0.0,
-            advance_width: advance_em * font_size,
-            matrix: None,
-        };
-
-        // (glyph, Helvetica per-em advance width)
-        let cases: &[(char, f32)] = &[('l', 0.278), ('r', 0.333), ('I', 0.278), ('i', 0.278)];
-        // Body-text sizes where narrow-glyph advance falls at or below 2 pt.
-        let sizes: &[f32] = &[7.0, 9.0, 11.0];
-
-        for &(glyph, advance_em) in cases {
-            for &font_size in sizes {
-                let advance = advance_em * font_size;
-                let mut extractor = TextExtractor::new();
-                extractor.chars = vec![
-                    narrow_char(glyph, 100.0, font_size, advance_em),
-                    narrow_char(glyph, 100.0 + advance, font_size, advance_em),
-                ];
-
-                extractor.deduplicate_overlapping_chars();
-                assert_eq!(
-                    extractor.chars.len(),
-                    2,
-                    "Adjacent narrow-glyph doublet ('{glyph}{glyph}') at {font_size} pt \
-                     (advance = {advance:.2} pt) must not be collapsed",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_deduplicate_still_collapses_narrow_glyph_stroke_fill_duplicates() {
-        // Positive regression: even with the advance-scaled threshold,
-        // stroke+fill render passes on narrow glyphs (two `l`s at ~0 pt
-        // offset) must still be collapsed. The ratio (0.30) comfortably
-        // catches real duplicates (< 5 % of one advance apart) while
-        // staying below typical heaviest kerning (~20 %).
+    fn test_deduplicate_keeps_repeated_narrow_letters_with_normal_advance() {
         let mut extractor = TextExtractor::new();
 
-        let narrow_at = |x: f32| TextChar {
+        let make_char = |x: f32| TextChar {
             char: 'l',
-            bbox: Rect::new(x, 700.0, 1.5, 9.0),
-            font_name: "Helvetica".to_string(),
-            font_size: 9.0,
+            bbox: Rect::new(x, 700.0, 0.7, 12.0),
+            font_name: "F1".to_string(),
+            font_size: 12.0,
             font_weight: FontWeight::Normal,
             color: Color::black(),
             mcid: None,
@@ -8871,20 +8892,17 @@ mod tests {
             origin_x: x,
             origin_y: 700.0,
             rotation_degrees: 0.0,
-            advance_width: 2.5, // 0.278 em × 9 pt
+            advance_width: 1.6,
             matrix: None,
         };
 
-        // Stroke pass and fill pass typically land within 0.05 pt of each
-        // other (2 % of advance at 9 pt Helvetica `l`).
-        extractor.chars = vec![narrow_at(100.0), narrow_at(100.05)];
+        extractor.chars = vec![make_char(100.0), make_char(101.6)];
 
         extractor.deduplicate_overlapping_chars();
         assert_eq!(
             extractor.chars.len(),
-            1,
-            "Stroke+fill narrow-glyph duplicates (same char at ~0 pt offset) \
-             must still be collapsed"
+            2,
+            "Real repeated narrow letters should not be collapsed as duplicate overprints"
         );
     }
 
@@ -8947,104 +8965,6 @@ mod tests {
         let mut extractor = TextExtractor::new();
         extractor.deduplicate_overlapping_spans();
         assert!(extractor.spans.is_empty());
-    }
-
-    #[test]
-    fn test_deduplicate_spans_keeps_narrow_glyph_doublets() {
-        // Regression: PDFs that emit kerned text glyph-by-glyph produce
-        // consecutive single-character spans. Two adjacent narrow-glyph
-        // spans (`l`, `r`, `I`, `i` at ≤ 9 pt) sit roughly one advance-width
-        // apart, which used to fall under the hardcoded 2 pt geometric
-        // threshold and get collapsed. The threshold now scales with each
-        // span's per-glyph width so legitimate doublets survive.
-        //
-        // Exercises the matrix of four narrow glyphs across three small
-        // body-text sizes.
-        let narrow_span =
-            |glyph: char, x: f32, font_size: f32, advance: f32, seq: usize| TextSpan {
-                artifact_type: None,
-                text: glyph.to_string(),
-                bbox: Rect::new(x, 700.0, advance, font_size),
-                font_name: "Helvetica".to_string(),
-                font_size,
-                font_weight: FontWeight::Normal,
-                color: Color::black(),
-                mcid: None,
-                sequence: seq,
-                split_boundary_before: false,
-                offset_semantic: false,
-                is_italic: false,
-                is_monospace: false,
-                char_spacing: 0.0,
-                word_spacing: 0.0,
-                horizontal_scaling: 100.0,
-                primary_detected: false,
-                char_widths: vec![],
-            };
-
-        // (glyph, Helvetica per-em advance width)
-        let cases: &[(char, f32)] = &[('l', 0.278), ('r', 0.333), ('I', 0.278), ('i', 0.278)];
-        let sizes: &[f32] = &[7.0, 9.0, 11.0];
-
-        for &(glyph, advance_em) in cases {
-            for &font_size in sizes {
-                let advance = advance_em * font_size;
-                let mut extractor = TextExtractor::new();
-                extractor.spans = vec![
-                    narrow_span(glyph, 100.0, font_size, advance, 0),
-                    narrow_span(glyph, 100.0 + advance, font_size, advance, 1),
-                ];
-
-                extractor.deduplicate_overlapping_spans();
-                assert_eq!(
-                    extractor.spans.len(),
-                    2,
-                    "Adjacent single-glyph narrow-doublet spans ('{glyph}{glyph}') \
-                     at {font_size} pt (advance = {advance:.2} pt) must not be collapsed",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_deduplicate_spans_still_collapses_stroke_fill_narrow_glyphs() {
-        // Positive regression: stroke+fill single-glyph narrow spans at
-        // ~0 pt offset must still be collapsed by the geometric dedup
-        // phase. The ratio (0.30) comfortably catches real duplicates
-        // while preserving legitimate doublets.
-        let mut extractor = TextExtractor::new();
-
-        let narrow_at = |x: f32, seq: usize| TextSpan {
-            artifact_type: None,
-            text: "l".to_string(),
-            bbox: Rect::new(x, 700.0, 2.5, 9.0),
-            font_name: "Helvetica".to_string(),
-            font_size: 9.0,
-            font_weight: FontWeight::Normal,
-            color: Color::black(),
-            mcid: None,
-            sequence: seq,
-            split_boundary_before: false,
-            offset_semantic: false,
-            is_italic: false,
-            is_monospace: false,
-            char_spacing: 0.0,
-            word_spacing: 0.0,
-            horizontal_scaling: 100.0,
-            primary_detected: false,
-            char_widths: vec![],
-        };
-
-        // Stroke pass + fill pass at ~2 % of advance apart.
-        extractor.spans = vec![narrow_at(100.0, 0), narrow_at(100.05, 1)];
-
-        extractor.deduplicate_overlapping_spans();
-        assert_eq!(
-            extractor.spans.len(),
-            1,
-            "Stroke+fill narrow-glyph duplicate spans (same text at ~0 pt offset) \
-             must still be collapsed"
-        );
     }
 
     // ========================================================================
@@ -9135,8 +9055,8 @@ mod tests {
         extractor.sort_by_reading_order();
         // PDF Y increases upward, so 700 is higher than 680
         // Reading order: top first, so A (y=700) before B (y=680)
-        assert_eq!(extractor.chars[0].char, 'A');
-        assert_eq!(extractor.chars[1].char, 'B');
+        assert_eq!(extractor.chars.get(0).unwrap().char, 'A');
+        assert_eq!(extractor.chars.get(1).unwrap().char, 'B');
     }
 
     #[test]
@@ -9179,8 +9099,8 @@ mod tests {
 
         extractor.sort_by_reading_order();
         // Same line: left to right
-        assert_eq!(extractor.chars[0].char, 'A');
-        assert_eq!(extractor.chars[1].char, 'B');
+        assert_eq!(extractor.chars.get(0).unwrap().char, 'A');
+        assert_eq!(extractor.chars.get(1).unwrap().char, 'B');
     }
 
     #[test]
@@ -9850,6 +9770,72 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_chars_visual_row_sort_uses_higher_baseline_first() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let stream = b"BT /F1 10 Tf 225 680 Td (R) Tj ET BT /F1 12 Tf 67 673 Td (L) Tj ET";
+        let chars = extractor.extract(stream).unwrap();
+        let text = chars.iter().map(|ch| ch.char).collect::<String>();
+
+        assert_eq!(text, "RL");
+    }
+
+    #[test]
+    fn test_extract_chars_interleaves_columns_by_reading_order() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let stream = b"BT /F1 12 Tf 50 700 Td (A) Tj ET \
+                       BT /F1 12 Tf 50 680 Td (B) Tj ET \
+                       BT /F1 12 Tf 300 690 Td (C) Tj ET";
+        let chars = extractor.extract(stream).unwrap();
+        let text = chars.iter().map(|ch| ch.char).collect::<String>();
+
+        assert_eq!(
+            text, "ACB",
+            "plain extract() should follow reading-order sort, not force full column-major traversal"
+        );
+    }
+
+    #[test]
+    fn test_extract_chars_prefers_higher_row_before_left_column() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let stream = b"BT /F1 12 Tf 312 209 Td (R) Tj ET \
+                       BT /F1 12 Tf 48 208 Td (L) Tj ET";
+        let chars = extractor.extract(stream).unwrap();
+        let text = chars.iter().map(|ch| ch.char).collect::<String>();
+
+        assert_eq!(
+            text, "RL",
+            "plain extract() should prefer the higher row even when it is in the right column"
+        );
+    }
+
+    #[test]
+    fn test_extract_chars_keeps_global_top_to_bottom_order_across_columns() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let stream = b"BT /F1 12 Tf 312 221 Td (R1) Tj ET \
+                       BT /F1 12 Tf 312 209 Td (R2) Tj ET \
+                       BT /F1 12 Tf 48 208 Td (L1) Tj ET";
+        let chars = extractor.extract(stream).unwrap();
+        let text = chars.iter().map(|ch| ch.char).collect::<String>();
+
+        assert_eq!(
+            text, "R1R2L1",
+            "plain extract() should keep the higher right-column rows ahead of the lower left-column row"
+        );
+    }
+
+    #[test]
     fn test_extract_empty_string() {
         let mut extractor = TextExtractor::new();
         let font = create_test_font();
@@ -9937,76 +9923,6 @@ mod tests {
                     .join("");
                 text.contains("A") && text.contains("B")
             }
-        );
-    }
-
-    // ========================================================================
-    // TESTS: merge_tm_tj_runs opt-out (#488)
-    // ========================================================================
-
-    /// With the default config (merge_tm_tj_runs = true), multiple Tm+Tj operators
-    /// on the same line are batched into a single span.
-    #[test]
-    fn test_merge_tm_tj_runs_default_merges() {
-        let mut extractor = TextExtractor::new();
-        extractor.merging_config = SpanMergingConfig::legacy(); // fixed thresholds, merging on
-        let font = create_test_font();
-        extractor.add_font("F1".to_string(), font);
-
-        // Three separate Tm+Tj on the same baseline (same Y, same a/b/c/d, ascending e)
-        let stream =
-            b"BT /F1 12 Tf 1 0 0 1 100 700 Tm (A) Tj 1 0 0 1 107 700 Tm (B) Tj 1 0 0 1 114 700 Tm (C) Tj ET";
-        let spans = extractor.extract_text_spans(stream).unwrap();
-
-        // All three characters must be present
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-        assert!(
-            text.contains('A') && text.contains('B') && text.contains('C'),
-            "All chars must be extracted, got: {:?}",
-            text
-        );
-
-        // The default merging should combine them into fewer spans than the number
-        // of Tm operators (3 Tms should not produce 3 separate spans)
-        assert!(
-            spans.len() < 3,
-            "Default merge_tm_tj_runs=true should combine same-line Tm+Tj into fewer than 3 spans, got {} spans",
-            spans.len()
-        );
-    }
-
-    /// With merge_tm_tj_runs = false, each Tm operator starts a fresh span.
-    #[test]
-    fn test_merge_tm_tj_runs_disabled_splits() {
-        let mut extractor = TextExtractor::new();
-        extractor.merging_config = SpanMergingConfig {
-            merge_tm_tj_runs: false,
-            ..SpanMergingConfig::legacy()
-        };
-        let font = create_test_font();
-        extractor.add_font("F1".to_string(), font);
-
-        // Three separate Tm+Tj on the same baseline
-        let stream =
-            b"BT /F1 12 Tf 1 0 0 1 100 700 Tm (A) Tj 1 0 0 1 107 700 Tm (B) Tj 1 0 0 1 114 700 Tm (C) Tj ET";
-        let spans = extractor.extract_text_spans(stream).unwrap();
-
-        // All three characters must still be present
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-        assert!(
-            text.contains('A') && text.contains('B') && text.contains('C'),
-            "All chars must be extracted even with merging disabled, got: {:?}",
-            text
-        );
-
-        // With merge disabled, each Tm flushes the buffer, so we get more spans
-        // than with merging enabled (post-processing merge_adjacent_spans may combine
-        // some, but at minimum we should get spans >= 1; the key invariant is that
-        // the span count here is NOT reduced by the Tm-continuation shortcut)
-        assert!(
-            spans.len() >= 2,
-            "merge_tm_tj_runs=false should not batch same-line runs; expected >= 2 spans, got {}",
-            spans.len()
         );
     }
 
@@ -10952,78 +10868,6 @@ mod tests {
     }
 
     // ========================================================================
-    // REGRESSION: named / unknown color space references (issue #444)
-    // ========================================================================
-
-    /// Named color space reference like "Cs1" should fall back by component
-    /// count rather than emitting a warn! (regression: warn spam on PDFs
-    /// with ICCBased color spaces registered under user-defined names).
-    #[test]
-    fn test_named_fill_color_space_fallback_gray() {
-        let mut e = TextExtractor::new();
-        e.execute_operator_public(Operator::SetFillColorSpace {
-            name: "Cs1".to_string(),
-        })
-        .unwrap();
-        e.execute_operator_public(Operator::SetFillColor {
-            components: vec![0.4],
-        })
-        .unwrap();
-        let state = e.state_stack.current();
-        let (r, g, b) = state.fill_color_rgb;
-        assert!((r - 0.4).abs() < 0.01 && (g - 0.4).abs() < 0.01 && (b - 0.4).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_named_fill_color_space_fallback_rgb() {
-        let mut e = TextExtractor::new();
-        e.execute_operator_public(Operator::SetFillColorSpace {
-            name: "Cs2".to_string(),
-        })
-        .unwrap();
-        e.execute_operator_public(Operator::SetFillColor {
-            components: vec![0.1, 0.2, 0.3],
-        })
-        .unwrap();
-        let state = e.state_stack.current();
-        assert!((state.fill_color_rgb.0 - 0.1).abs() < 0.01);
-        assert!((state.fill_color_rgb.1 - 0.2).abs() < 0.01);
-        assert!((state.fill_color_rgb.2 - 0.3).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_named_fill_color_space_fallback_cmyk() {
-        let mut e = TextExtractor::new();
-        e.execute_operator_public(Operator::SetFillColorSpace {
-            name: "Cs3".to_string(),
-        })
-        .unwrap();
-        e.execute_operator_public(Operator::SetFillColor {
-            components: vec![0.0, 0.0, 0.0, 0.5],
-        })
-        .unwrap();
-        let state = e.state_stack.current();
-        assert!(state.fill_color_cmyk.is_some());
-    }
-
-    #[test]
-    fn test_named_stroke_color_space_fallback_rgb() {
-        let mut e = TextExtractor::new();
-        e.execute_operator_public(Operator::SetStrokeColorSpace {
-            name: "Cs1".to_string(),
-        })
-        .unwrap();
-        e.execute_operator_public(Operator::SetStrokeColor {
-            components: vec![0.5, 0.6, 0.7],
-        })
-        .unwrap();
-        let state = e.state_stack.current();
-        assert!((state.stroke_color_rgb.0 - 0.5).abs() < 0.01);
-        assert!((state.stroke_color_rgb.1 - 0.6).abs() < 0.01);
-        assert!((state.stroke_color_rgb.2 - 0.7).abs() < 0.01);
-    }
-
-    // ========================================================================
     // COVERAGE TESTS: Line style & misc operators
     // ========================================================================
 
@@ -11849,7 +11693,7 @@ mod tests {
         let mut extractor = TextExtractor::new();
         let font = create_test_font();
         extractor.add_font("F1".to_string(), font);
-        extractor.cached_current_font = extractor.fonts.get("F1").cloned();
+        extractor.set_cached_current_font(extractor.fonts.get("F1").cloned());
         extractor.state_stack.current_mut().font_size = 12.0;
         extractor.state_stack.current_mut().font_name = Some("F1".to_string());
         extractor.state_stack.current_mut().horizontal_scaling = 100.0;
@@ -12605,63 +12449,6 @@ mod tests {
     }
 
     // ========================================================================
-    // TDD: decode_pdf_text_string — PDFDocEncoding fallback correctness
-    // Bytes 0xA0–0xFF and the special 0x80–0x9E zone must decode through
-    // PDFDocEncoding, not through from_utf8_lossy (which produces U+FFFD).
-    // ========================================================================
-
-    #[test]
-    fn test_decode_pdfdocencoding_latin_byte() {
-        // 0xE9 = PDFDocEncoding for é (U+00E9).  Not valid UTF-8 on its own.
-        let result = TextExtractor::decode_pdf_text_string(&[0xE9]);
-        assert_eq!(result, "é", "0xE9 must decode as 'é' via PDFDocEncoding, not produce U+FFFD");
-    }
-
-    #[test]
-    fn test_decode_pdfdocencoding_bullet() {
-        // 0x80 = PDFDocEncoding for • (U+2022 BULLET)
-        let result = TextExtractor::decode_pdf_text_string(&[0x80]);
-        assert_eq!(result, "•", "0x80 must decode as bullet '•' via PDFDocEncoding");
-    }
-
-    #[test]
-    fn test_decode_pdfdocencoding_emdash() {
-        // 0x84 = PDFDocEncoding for — (U+2014 EM DASH)
-        let result = TextExtractor::decode_pdf_text_string(&[0x84]);
-        assert_eq!(result, "—", "0x84 must decode as em-dash '—' via PDFDocEncoding");
-    }
-
-    #[test]
-    fn test_decode_pdfdocencoding_trademark() {
-        // 0x92 = PDFDocEncoding for ™ (U+2122 TRADE MARK SIGN)
-        let result = TextExtractor::decode_pdf_text_string(&[0x92]);
-        assert_eq!(result, "™", "0x92 must decode as trademark '™' via PDFDocEncoding");
-    }
-
-    #[test]
-    fn test_decode_pdfdocencoding_undefined_9f_is_dropped() {
-        // 0x9F is undefined in PDFDocEncoding — must be silently dropped.
-        let result = TextExtractor::decode_pdf_text_string(&[0x41, 0x9F, 0x42]);
-        assert_eq!(result, "AB", "0x9F is undefined in PDFDocEncoding and must be dropped");
-    }
-
-    #[test]
-    fn test_decode_pdfdocencoding_mixed_ascii_and_latin() {
-        // "Hello" followed by 0xE9 (é): 6 bytes → "Helloé"
-        let bytes: Vec<u8> = b"Hello".iter().copied().chain([0xE9]).collect();
-        let result = TextExtractor::decode_pdf_text_string(&bytes);
-        assert_eq!(result, "Helloé", "Mixed ASCII + PDFDocEncoding bytes must decode correctly");
-    }
-
-    #[test]
-    fn test_decode_pdfdocencoding_utf8_bytes_still_work() {
-        // Valid UTF-8 without BOM: must still decode correctly (for lenient PDFs).
-        // ASCII is a subset of UTF-8, so this path always works.
-        let result = TextExtractor::decode_pdf_text_string(b"ASCII text");
-        assert_eq!(result, "ASCII text");
-    }
-
-    // ========================================================================
     // COVERAGE TESTS: shared truetype cmaps (no donors)
     // ========================================================================
 
@@ -12997,6 +12784,64 @@ fn test_get_current_actual_text_returns_none_when_empty() {
 
     let result = extractor.get_current_actual_text();
     assert_eq!(result, None);
+}
+
+#[cfg(test)]
+fn create_actual_text_test_font() -> FontInfo {
+    FontInfo {
+        base_font: "Times-Roman".to_string(),
+        subtype: "Type1".to_string(),
+        encoding: crate::fonts::Encoding::Standard("WinAnsiEncoding".to_string()),
+        to_unicode: None,
+        font_weight: None,
+        flags: None,
+        stem_v: None,
+        embedded_font_data: None,
+        truetype_cmap: std::sync::OnceLock::new(),
+        is_truetype_font: false,
+        widths: None,
+        first_char: None,
+        last_char: None,
+        default_width: 1000.0,
+        cid_to_gid_map: None,
+        cid_system_info: None,
+        cid_font_type: None,
+        cid_widths: None,
+        cid_default_width: 1000.0,
+        has_explicit_dw: false,
+        cff_gid_map: None,
+        multi_char_map: HashMap::new(),
+        byte_to_char_table: std::sync::OnceLock::new(),
+        byte_to_width_table: std::sync::OnceLock::new(),
+    }
+}
+
+#[test]
+fn test_extract_chars_uses_decoded_actual_text_for_tj() {
+    let mut extractor = TextExtractor::new();
+    extractor.add_font("F1".to_string(), create_actual_text_test_font());
+
+    let chars = extractor
+        .extract(b"BT /F1 12 Tf 100 700 Td /Span << /ActualText <FEFF00A0> >> BDC ( ) Tj EMC ET")
+        .expect("extract chars with ActualText Tj");
+
+    let text = chars.iter().map(|ch| ch.char).collect::<String>();
+    assert_eq!(chars.len(), 1, "ActualText should emit one decoded character");
+    assert_eq!(text, "\u{00A0}");
+}
+
+#[test]
+fn test_extract_chars_uses_decoded_actual_text_for_tj_array() {
+    let mut extractor = TextExtractor::new();
+    extractor.add_font("F1".to_string(), create_actual_text_test_font());
+
+    let chars = extractor
+        .extract(b"BT /F1 12 Tf 100 700 Td /Span << /ActualText <FEFF00A0> >> BDC [( )] TJ EMC ET")
+        .expect("extract chars with ActualText TJ");
+
+    let text = chars.iter().map(|ch| ch.char).collect::<String>();
+    assert_eq!(chars.len(), 1, "ActualText should replace the full TJ array");
+    assert_eq!(text, "\u{00A0}");
 }
 
 // ============================================================================
