@@ -121,6 +121,7 @@ struct CachedTightFontMetrics {
     x_height: f32,
     parsed_face: Option<Arc<OwnedFace>>,
     parsed_face_source: Option<ParsedFaceSource>,
+    system_fallback_attempted: bool,
     glyph_boxes: HashMap<u16, Option<GlyphBox1000>>,
     #[cfg(feature = "type1-freetype")]
     type1_face: Option<Type1FreeTypeFace>,
@@ -179,11 +180,8 @@ impl CachedTightFontMetrics {
     }
 
     fn from_font(font: &FontInfo) -> Self {
-        let parsed_face_with_source = font.parsed_face_with_source();
-        let parsed_face = parsed_face_with_source
-            .as_ref()
-            .map(|(face, _)| face.clone());
-        let parsed_face_source = parsed_face_with_source.map(|(_, source)| source);
+        let parsed_face = crate::fonts::glyph_backend::embedded_parsed_face(font);
+        let parsed_face_source = parsed_face.as_ref().map(|_| ParsedFaceSource::Embedded);
         #[cfg(feature = "type1-freetype")]
         let type1_face = if matches!(font.subtype.as_str(), "Type1" | "MMType1") {
             font.embedded_font_data
@@ -206,6 +204,7 @@ impl CachedTightFontMetrics {
                     * scale,
                 parsed_face,
                 parsed_face_source,
+                system_fallback_attempted: false,
                 glyph_boxes: HashMap::new(),
                 #[cfg(feature = "type1-freetype")]
                 type1_face,
@@ -223,6 +222,7 @@ impl CachedTightFontMetrics {
             x_height,
             parsed_face: None,
             parsed_face_source: None,
+            system_fallback_attempted: false,
             glyph_boxes: HashMap::new(),
             #[cfg(feature = "type1-freetype")]
             type1_face,
@@ -304,9 +304,22 @@ impl CachedTightFontMetrics {
             }
         }
 
+        self.ensure_system_fallback_face(font);
+
         let face = self.parsed_face.as_ref()?;
         let glyph_id = face.as_ref().as_face_ref().glyph_index(unicode_char)?.0;
         self.glyph_box_for_gid(glyph_id)
+    }
+
+    fn ensure_system_fallback_face(&mut self, font: &FontInfo) {
+        if self.parsed_face.is_some() || self.system_fallback_attempted {
+            return;
+        }
+        self.system_fallback_attempted = true;
+        if let Some(face) = crate::fonts::glyph_backend::system_fallback_face(font) {
+            self.parsed_face = Some(face);
+            self.parsed_face_source = Some(ParsedFaceSource::SystemFallback);
+        }
     }
 
     fn heuristic_vertical_bounds(&self, unicode_char: char) -> (f32, f32) {
@@ -2760,7 +2773,6 @@ impl TextExtractor {
         {
             return;
         }
-
         if self.should_suppress_near_duplicate_char(&text_char, char_code, dedupe_threshold) {
             return;
         }

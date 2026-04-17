@@ -100,42 +100,50 @@ fn font_data_looks_like_sfnt(data: &[u8]) -> bool {
         )
 }
 
+#[cfg(test)]
 pub(crate) fn parsed_face_with_source(
     font: &FontInfo,
 ) -> Option<(Arc<OwnedFace>, ParsedFaceSource)> {
-    if let Some(font_data) = font.embedded_font_data.as_ref() {
-        let has_embedded_sfnt =
-            !font_data.is_empty() && (font.is_truetype_font || font_data_looks_like_sfnt(font_data));
-        if has_embedded_sfnt {
-            let cache_key = parsed_face_cache_key(font)?;
+    if let Some(face) = embedded_parsed_face(font) {
+        return Some((face, ParsedFaceSource::Embedded));
+    }
 
-            if let Ok(cache) = PARSED_FACE_CACHE.lock() {
-                if let Some(cached) = cache.get(&cache_key) {
-                    return cached
-                        .clone()
-                        .map(|face| (face, ParsedFaceSource::Embedded));
-                }
-            }
+    system_fallback_face(font).map(|face| (face, ParsedFaceSource::SystemFallback))
+}
 
-            let parsed = match OwnedFace::from_vec(font_data.as_ref().to_vec(), 0) {
-                Ok(face) => Some(Arc::new(face)),
-                Err(e) => {
-                    log::warn!("Font '{}': embedded face parse failed: {}", font.base_font, e);
-                    None
-                },
-            };
+pub(crate) fn embedded_parsed_face(font: &FontInfo) -> Option<Arc<OwnedFace>> {
+    let font_data = font.embedded_font_data.as_ref()?;
+    let has_embedded_sfnt =
+        !font_data.is_empty() && (font.is_truetype_font || font_data_looks_like_sfnt(font_data));
+    if !has_embedded_sfnt {
+        return None;
+    }
 
-            if let Ok(mut cache) = PARSED_FACE_CACHE.lock() {
-                cache.insert(cache_key, parsed.clone());
-            }
+    let cache_key = parsed_face_cache_key(font)?;
 
-            if parsed.is_some() {
-                return parsed.map(|face| (face, ParsedFaceSource::Embedded));
-            }
+    if let Ok(cache) = PARSED_FACE_CACHE.lock() {
+        if let Some(cached) = cache.get(&cache_key) {
+            return cached.clone();
         }
     }
 
-    load_system_font_face(&font.base_font).map(|face| (face, ParsedFaceSource::SystemFallback))
+    let parsed = match OwnedFace::from_vec(font_data.as_ref().to_vec(), 0) {
+        Ok(face) => Some(Arc::new(face)),
+        Err(e) => {
+            log::warn!("Font '{}': embedded face parse failed: {}", font.base_font, e);
+            None
+        },
+    };
+
+    if let Ok(mut cache) = PARSED_FACE_CACHE.lock() {
+        cache.insert(cache_key, parsed.clone());
+    }
+
+    parsed
+}
+
+pub(crate) fn system_fallback_face(font: &FontInfo) -> Option<Arc<OwnedFace>> {
+    load_system_font_face(&font.base_font)
 }
 
 #[cfg(test)]
@@ -146,6 +154,47 @@ pub(crate) fn parsed_face_source(font: &FontInfo) -> Option<ParsedFaceSource> {
 #[cfg(test)]
 pub(crate) fn parsed_face(font: &FontInfo) -> Option<Arc<OwnedFace>> {
     parsed_face_with_source(font).map(|(face, _)| face)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fonts::font_dict::{CIDToGIDMap, Encoding, FontInfo};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn embedded_face_loader_does_not_use_system_fallback_for_missing_embedded_data() {
+        let font = FontInfo {
+            base_font: "DefinitelyMissingSystemFallbackProbe".to_string(),
+            subtype: "Type1".to_string(),
+            encoding: Encoding::Standard("WinAnsiEncoding".to_string()),
+            to_unicode: None,
+            font_weight: None,
+            flags: None,
+            stem_v: None,
+            embedded_font_data: None,
+            truetype_cmap: std::sync::OnceLock::new(),
+            is_truetype_font: false,
+            cid_to_gid_map: None,
+            cid_system_info: None,
+            cid_font_type: None,
+            widths: None,
+            first_char: None,
+            last_char: None,
+            default_width: 500.0,
+            cid_widths: None,
+            cid_default_width: 1000.0,
+            multi_char_map: HashMap::new(),
+            cff_gid_map: None,
+            byte_to_char_table: std::sync::OnceLock::new(),
+            byte_to_width_table: std::sync::OnceLock::new(),
+        };
+
+        let _unused_arc: Option<Arc<OwnedFace>> = None;
+        let _unused_cid: Option<CIDToGIDMap> = None;
+        assert!(embedded_parsed_face(&font).is_none());
+    }
 }
 
 pub(crate) fn cff_cid_gid_map(font: &FontInfo) -> Option<Arc<HashMap<u16, u16>>> {

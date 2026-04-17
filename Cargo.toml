@@ -136,6 +136,7 @@ imageproc = { version = "0.26", optional = true }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+dirs = "6"
 
 # XML parsing (for XMP metadata)
 quick-xml = "0.39"
