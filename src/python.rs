@@ -1687,6 +1687,25 @@ impl PyPdfDocument {
         Ok(dict.into())
     }
 
+    /// Extract PDF-native resolved spans with precise chars and boxes.
+    ///
+    /// Args:
+    ///     page: Zero-based page index.
+    ///
+    /// Returns:
+    ///     list[ResolvedSpan]: Resolved spans in PDF-native order.
+    fn extract_resolved_spans(&mut self, page: usize) -> PyResult<Vec<PyResolvedSpan>> {
+        self.inner
+            .extract_resolved_spans(page)
+            .map(|spans| {
+                spans
+                    .into_iter()
+                    .map(|span| PyResolvedSpan { inner: span })
+                    .collect()
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
     /// Get document outline.
     fn get_outline(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let outline = self
@@ -3544,6 +3563,134 @@ impl PyTextSpan {
     #[getter]
     fn color(&self) -> (f32, f32, f32) {
         (self.inner.color.r, self.inner.color.g, self.inner.color.b)
+    }
+}
+
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "ResolvedChar",
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub struct PyResolvedChar {
+    inner: crate::layout::ResolvedChar,
+}
+#[pymethods]
+impl PyResolvedChar {
+    #[getter]
+    fn text(&self) -> char {
+        self.inner.text
+    }
+    #[getter]
+    fn bbox(&self) -> (f32, f32, f32, f32) {
+        (
+            self.inner.bbox.x,
+            self.inner.bbox.y,
+            self.inner.bbox.width,
+            self.inner.bbox.height,
+        )
+    }
+    #[getter]
+    fn rotation_degrees(&self) -> Option<f32> {
+        self.inner.rotation_degrees
+    }
+}
+
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "ResolvedStyle",
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub struct PyResolvedStyle {
+    inner: crate::layout::ResolvedStyle,
+}
+#[pymethods]
+impl PyResolvedStyle {
+    #[getter]
+    fn font_name(&self) -> &str {
+        &self.inner.font_name
+    }
+    #[getter]
+    fn font_size(&self) -> f32 {
+        self.inner.font_size
+    }
+    #[getter]
+    fn font_weight(&self) -> String {
+        format!("{:?}", self.inner.font_weight)
+    }
+    #[getter]
+    fn is_italic(&self) -> bool {
+        self.inner.is_italic
+    }
+    #[getter]
+    fn is_monospace(&self) -> bool {
+        self.inner.is_monospace
+    }
+    #[getter]
+    fn color(&self) -> (f32, f32, f32) {
+        (self.inner.color.r, self.inner.color.g, self.inner.color.b)
+    }
+    #[getter]
+    fn char_spacing(&self) -> f32 {
+        self.inner.char_spacing
+    }
+    #[getter]
+    fn word_spacing(&self) -> f32 {
+        self.inner.word_spacing
+    }
+    #[getter]
+    fn horizontal_scaling(&self) -> f32 {
+        self.inner.horizontal_scaling
+    }
+}
+
+#[pyclass(
+    module = "pdf_oxide.pdf_oxide",
+    name = "ResolvedSpan",
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub struct PyResolvedSpan {
+    inner: crate::layout::ResolvedSpan,
+}
+#[pymethods]
+impl PyResolvedSpan {
+    #[getter]
+    fn text(&self) -> &str {
+        &self.inner.text
+    }
+    #[getter]
+    fn bbox(&self) -> (f32, f32, f32, f32) {
+        (
+            self.inner.bbox.x,
+            self.inner.bbox.y,
+            self.inner.bbox.width,
+            self.inner.bbox.height,
+        )
+    }
+    #[getter]
+    fn sequence(&self) -> usize {
+        self.inner.sequence
+    }
+    #[getter]
+    fn mcid(&self) -> Option<u32> {
+        self.inner.mcid
+    }
+    #[getter]
+    fn style(&self) -> PyResolvedStyle {
+        PyResolvedStyle {
+            inner: self.inner.style.clone(),
+        }
+    }
+    #[getter]
+    fn chars(&self) -> Vec<PyResolvedChar> {
+        self.inner
+            .chars
+            .iter()
+            .cloned()
+            .map(|ch| PyResolvedChar { inner: ch })
+            .collect()
     }
 }
 
@@ -7222,6 +7369,9 @@ fn pdf_oxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAnnotationWrapper>()?;
     m.add_class::<PyTextChar>()?;
     m.add_class::<PyTextSpan>()?;
+    m.add_class::<PyResolvedChar>()?;
+    m.add_class::<PyResolvedStyle>()?;
+    m.add_class::<PyResolvedSpan>()?;
     m.add_class::<PyWord>()?;
     m.add_class::<PyTextLine>()?;
     m.add_class::<PyPdfPageRegion>()?;

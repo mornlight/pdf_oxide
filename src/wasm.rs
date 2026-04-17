@@ -745,6 +745,22 @@ impl WasmPdfDocument {
             .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
     }
 
+    /// Extract PDF-native resolved spans with precise chars and boxes.
+    #[wasm_bindgen(js_name = "extractResolvedSpans")]
+    pub fn extract_resolved_spans(&mut self, page_index: usize) -> Result<JsValue, JsValue> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| JsValue::from_str("Mutex lock failed"))?;
+
+        let spans = inner
+            .extract_resolved_spans(page_index)
+            .map_err(|e| JsValue::from_str(&format!("Failed to extract resolved spans: {}", e)))?;
+
+        serde_wasm_bindgen::to_value(&spans)
+            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+    }
+
     /// Extract word-level data from a page.
     ///
     /// Returns an array of objects with: text, bbox, font_name, font_size,
@@ -5527,6 +5543,14 @@ mod tests {
     fn test_extract_spans_ok() {
         let mut doc = doc_from_text("Hello spans");
         let result = doc.extract_spans(0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn test_extract_resolved_spans_ok() {
+        let mut doc = doc_from_text("Hello resolved");
+        let result = doc.extract_resolved_spans(0);
         assert!(result.is_ok());
     }
 
