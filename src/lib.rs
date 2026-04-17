@@ -266,7 +266,7 @@ pub use annotations::{Annotation, LinkAction, LinkDestination};
 pub use config::{DocumentType, ExtractionProfile};
 pub use document::{ExtractedImageRef, ImageFormat, PdfDocument, ReadingOrder};
 pub use error::{Error, Result};
-pub use layout::PageText;
+pub use layout::{PageText, ResolvedSpan};
 pub use outline::{Destination, OutlineItem};
 
 // Global font cache for batch processing

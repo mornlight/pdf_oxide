@@ -10,6 +10,7 @@ pub mod area_filter;
 pub mod clustering;
 pub mod document_analyzer;
 pub mod reading_order;
+pub mod resolved_text;
 pub mod text_block;
 
 // Phase 2: Core architectural components
@@ -20,6 +21,7 @@ pub mod font_normalization;
 pub use area_filter::{LayoutObjectSpatial, RectFilterMode, SpatialCollectionFiltering};
 pub use document_analyzer::{AdaptiveLayoutParams, DocumentProperties};
 pub use reading_order::graph_based_reading_order;
+pub use resolved_text::{ResolvedChar, ResolvedSpan, ResolvedStyle};
 pub use text_block::{Color, FontWeight, PageText, TextBlock, TextChar, TextLine, TextSpan, Word};
 
 // Re-export Phase 2 components

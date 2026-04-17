@@ -10,15 +10,25 @@ use crate::content::operators::{Operator, TextElement};
 use crate::content::parse_and_execute_text_only;
 use crate::error::Result;
 use crate::extract_log_debug;
+use crate::extractors::resolved_builder::ResolvedCollector;
+use crate::fonts::glyph_backend::ParsedFaceSource;
 use crate::fonts::FontInfo;
 use crate::geometry::Rect;
-use crate::layout::{Color, FontWeight, TextChar, TextSpan};
+use crate::layout::{
+    Color, FontWeight, ResolvedChar, ResolvedSpan, ResolvedStyle, TextChar, TextSpan,
+};
 use crate::object::{Object, ObjectRef};
 use crate::pipeline::config::WordBoundaryMode;
 use crate::text::{BoundaryContext, CharacterInfo, DocumentScript, WordBoundaryDetector};
+use owned_ttf_parser::{AsFaceRef, OwnedFace};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use ttf_parser::GlyphId;
+
+#[cfg(feature = "type1-freetype")]
+use crate::fonts::type1_freetype::{Type1FreeTypeFace, Type1GlyphBox1000};
 
 /// Source of a space decision in the unified pipeline.
 ///
@@ -93,6 +103,353 @@ impl SpaceDecision {
             confidence: confidence.clamp(0.0, 1.0),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GlyphBox1000 {
+    x_min: f32,
+    y_min: f32,
+    x_max: f32,
+    y_max: f32,
+}
+
+#[derive(Debug)]
+struct CachedTightFontMetrics {
+    ascender: f32,
+    descender: f32,
+    cap_height: f32,
+    x_height: f32,
+    parsed_face: Option<Arc<OwnedFace>>,
+    parsed_face_source: Option<ParsedFaceSource>,
+    glyph_boxes: HashMap<u16, Option<GlyphBox1000>>,
+    #[cfg(feature = "type1-freetype")]
+    type1_face: Option<Type1FreeTypeFace>,
+    #[cfg(feature = "type1-freetype")]
+    type1_glyph_boxes: HashMap<u32, Option<GlyphBox1000>>,
+}
+
+#[derive(Debug, Default)]
+struct ResolvedTextRuntime {
+    cached_current_tight_font_metrics_key: Option<u64>,
+    cached_current_tight_font_metrics: Option<CachedTightFontMetrics>,
+    tight_font_metrics_cache: HashMap<u64, CachedTightFontMetrics>,
+    collector: ResolvedCollector,
+    sequence_counter: usize,
+}
+
+#[derive(Debug, Default)]
+struct TextRunRuntime {
+    recent_plain_chars: Vec<TextChar>,
+    resolved: Option<ResolvedTextRuntime>,
+}
+
+impl TextRunRuntime {
+    fn plain() -> Self {
+        Self::default()
+    }
+
+    fn resolved() -> Self {
+        Self {
+            recent_plain_chars: Vec::new(),
+            resolved: Some(ResolvedTextRuntime::default()),
+        }
+    }
+}
+
+impl CachedTightFontMetrics {
+    fn cache_key(font: &FontInfo) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        font.base_font.hash(&mut hasher);
+        font.subtype.hash(&mut hasher);
+        match &font.encoding {
+            crate::fonts::Encoding::Standard(name) => {
+                0u8.hash(&mut hasher);
+                name.hash(&mut hasher);
+            },
+            crate::fonts::Encoding::Custom(_) => {
+                1u8.hash(&mut hasher);
+            },
+            crate::fonts::Encoding::Identity => {
+                2u8.hash(&mut hasher);
+            },
+        }
+        font.cid_font_type.hash(&mut hasher);
+        font.cid_to_gid_map.is_some().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn from_font(font: &FontInfo) -> Self {
+        let parsed_face_with_source = font.parsed_face_with_source();
+        let parsed_face = parsed_face_with_source
+            .as_ref()
+            .map(|(face, _)| face.clone());
+        let parsed_face_source = parsed_face_with_source.map(|(_, source)| source);
+        #[cfg(feature = "type1-freetype")]
+        let type1_face = if matches!(font.subtype.as_str(), "Type1" | "MMType1") {
+            font.embedded_font_data
+                .as_ref()
+                .and_then(|font_data| Type1FreeTypeFace::from_font_data(font_data.clone()))
+        } else {
+            None
+        };
+        if let Some(face) = parsed_face.as_ref() {
+            let ttf = face.as_ref().as_face_ref();
+            let scale = 1000.0 / ttf.units_per_em() as f32;
+            return Self {
+                ascender: ttf.ascender() as f32 * scale,
+                descender: ttf.descender() as f32 * scale,
+                cap_height: ttf.capital_height().unwrap_or(ttf.ascender()) as f32 * scale,
+                x_height: ttf
+                    .x_height()
+                    .unwrap_or((ttf.ascender() as f32 * 0.5) as i16)
+                    as f32
+                    * scale,
+                parsed_face,
+                parsed_face_source,
+                glyph_boxes: HashMap::new(),
+                #[cfg(feature = "type1-freetype")]
+                type1_face,
+                #[cfg(feature = "type1-freetype")]
+                type1_glyph_boxes: HashMap::new(),
+            };
+        }
+
+        let (ascender, descender, cap_height, x_height) =
+            base14_vertical_metrics(&font.base_font).unwrap_or((750.0, -250.0, 700.0, 500.0));
+        Self {
+            ascender,
+            descender,
+            cap_height,
+            x_height,
+            parsed_face: None,
+            parsed_face_source: None,
+            glyph_boxes: HashMap::new(),
+            #[cfg(feature = "type1-freetype")]
+            type1_face,
+            #[cfg(feature = "type1-freetype")]
+            type1_glyph_boxes: HashMap::new(),
+        }
+    }
+
+    #[cfg(feature = "type1-freetype")]
+    fn convert_type1_glyph_box(glyph_box: Type1GlyphBox1000) -> GlyphBox1000 {
+        GlyphBox1000 {
+            x_min: glyph_box.x_min,
+            y_min: glyph_box.y_min,
+            x_max: glyph_box.x_max,
+            y_max: glyph_box.y_max,
+        }
+    }
+
+    fn glyph_box_for_gid(&mut self, glyph_id: u16) -> Option<GlyphBox1000> {
+        if let Some(cached) = self.glyph_boxes.get(&glyph_id) {
+            return *cached;
+        }
+
+        let bbox = self.parsed_face.as_ref().and_then(|face| {
+            let face = face.as_ref().as_face_ref();
+            let bbox = face.glyph_bounding_box(GlyphId(glyph_id))?;
+            let scale = 1000.0 / face.units_per_em() as f32;
+            Some(GlyphBox1000 {
+                x_min: bbox.x_min as f32 * scale,
+                y_min: bbox.y_min as f32 * scale,
+                x_max: bbox.x_max as f32 * scale,
+                y_max: bbox.y_max as f32 * scale,
+            })
+        });
+
+        self.glyph_boxes.insert(glyph_id, bbox);
+        bbox
+    }
+
+    fn glyph_box_for_pdf_char(
+        &mut self,
+        font: &FontInfo,
+        char_code: u32,
+        unicode_char: char,
+    ) -> Option<GlyphBox1000> {
+        #[cfg(feature = "type1-freetype")]
+        if let Some(type1_face) = self.type1_face.as_ref() {
+            if matches!(font.subtype.as_str(), "Type1" | "MMType1") {
+                if let Some(cached) = self.type1_glyph_boxes.get(&char_code) {
+                    return *cached;
+                }
+
+                let glyph_box = type1_face
+                    .glyph_box_for_char_code(char_code)
+                    .or_else(|| {
+                        font.type1_glyph_name_for_pdf_char_code(char_code)
+                            .and_then(|glyph_name| type1_face.glyph_box_for_name(&glyph_name))
+                    })
+                    .map(Self::convert_type1_glyph_box);
+                self.type1_glyph_boxes.insert(char_code, glyph_box);
+                if glyph_box.is_some() {
+                    return glyph_box;
+                }
+            }
+        }
+
+        // Embedded raw Type1 fonts may only be "parseable" via a substituted
+        // system font. That substitute can be useful for diagnostics, but its
+        // glyph geometry is not trustworthy as the PDF's real char box.
+        if font.embedded_font_data.is_some()
+            && self.parsed_face_source == Some(ParsedFaceSource::SystemFallback)
+        {
+            return None;
+        }
+
+        if let Some(glyph_id) = font.glyph_id_for_pdf_char_code(char_code) {
+            if let Some(bbox) = self.glyph_box_for_gid(glyph_id) {
+                return Some(bbox);
+            }
+        }
+
+        let face = self.parsed_face.as_ref()?;
+        let glyph_id = face.as_ref().as_face_ref().glyph_index(unicode_char)?.0;
+        self.glyph_box_for_gid(glyph_id)
+    }
+
+    fn heuristic_vertical_bounds(&self, unicode_char: char) -> (f32, f32) {
+        if unicode_char.is_whitespace() {
+            // pdfium reports explicit spaces as a baseline-aligned near-zero-height box,
+            // not a full glyph-height rectangle. Keep a tiny positive height so the box
+            // remains comparable without inflating it into a regular character box.
+            return (0.0, 1.0);
+        }
+
+        const HEURISTIC_TOP_CONTRACTION: f32 = 0.96;
+        const HEURISTIC_DIGIT_TOP_CONTRACTION: f32 = 0.84;
+
+        if unicode_char == '.' {
+            return (0.0, (self.x_height * 0.12).max(40.0));
+        }
+
+        if unicode_char == ',' {
+            return (
+                self.descender.min(-self.x_height * 0.18).min(-60.0),
+                (self.x_height * 0.18).max(60.0),
+            );
+        }
+
+        let descender_chars = matches!(unicode_char, 'g' | 'j' | 'p' | 'q' | 'y');
+        let ascender_chars = matches!(unicode_char, 'b' | 'd' | 'f' | 'h' | 'k' | 'l' | 't');
+
+        let top = if unicode_char.is_ascii_digit() {
+            self.cap_height.max(self.x_height) * HEURISTIC_DIGIT_TOP_CONTRACTION
+        } else if unicode_char.is_uppercase() {
+            self.cap_height.max(self.x_height)
+        } else if ascender_chars {
+            self.ascender
+        } else if unicode_char.is_ascii_lowercase() {
+            self.x_height
+        } else if matches!(unicode_char, ',' | ';' | '_') {
+            self.x_height * 0.5
+        } else {
+            self.ascender
+        } * HEURISTIC_TOP_CONTRACTION;
+
+        let bottom = if descender_chars || matches!(unicode_char, ',' | ';' | '_') {
+            self.descender.min(-self.x_height * 0.25)
+        } else {
+            0.0
+        };
+
+        (bottom, top)
+    }
+
+    fn heuristic_horizontal_bounds(&self, unicode_char: char, advance_width: f32) -> (f32, f32) {
+        if advance_width <= 0.0 {
+            return (0.0, advance_width);
+        }
+
+        match unicode_char {
+            '.' => {
+                let left = advance_width * 0.13;
+                let width = advance_width * 0.24;
+                (left, (left + width).min(advance_width))
+            },
+            ',' => {
+                let left = advance_width * 0.11;
+                let width = advance_width * 0.27;
+                (left, (left + width).min(advance_width))
+            },
+            _ => (0.0, advance_width),
+        }
+    }
+
+    fn glyph_box_looks_reasonable(
+        &self,
+        font: &FontInfo,
+        glyph_box: GlyphBox1000,
+        advance_width: f32,
+        font_size: f32,
+        horizontal_scaling: f32,
+    ) -> bool {
+        let fs_factor = font_size / 1000.0;
+        let hs_factor = horizontal_scaling / 100.0;
+        let glyph_height = (glyph_box.y_max - glyph_box.y_min).abs() * fs_factor;
+        let glyph_width = (glyph_box.x_max - glyph_box.x_min).abs() * fs_factor * hs_factor;
+        let nominal_height = (self.ascender - self.descender).abs() * fs_factor;
+        let nominal_width = advance_width.abs().max(1.0);
+        let height_multiplier = self.glyph_height_reasonable_multiplier(font);
+
+        glyph_height.is_finite()
+            && glyph_width.is_finite()
+            && glyph_height > 0.0
+            && glyph_width >= 0.0
+            && glyph_height <= nominal_height.max(font_size.abs()) * height_multiplier
+            && glyph_width <= nominal_width * 2.5 + 1.0
+    }
+
+    #[cfg(feature = "type1-freetype")]
+    fn glyph_height_reasonable_multiplier(&self, font: &FontInfo) -> f32 {
+        if matches!(font.subtype.as_str(), "Type1" | "MMType1") && self.type1_face.is_some() {
+            3.0
+        } else {
+            1.6
+        }
+    }
+
+    #[cfg(not(feature = "type1-freetype"))]
+    fn glyph_height_reasonable_multiplier(&self, _font: &FontInfo) -> f32 {
+        1.6
+    }
+}
+
+fn base14_vertical_metrics(font_name: &str) -> Option<(f32, f32, f32, f32)> {
+    let normalized = font_name.rsplit('+').next().unwrap_or(font_name);
+    match normalized {
+        "Helvetica" | "Helvetica-Oblique" => Some((718.0, -207.0, 718.0, 523.0)),
+        "Helvetica-Bold" | "Helvetica-BoldOblique" => Some((718.0, -207.0, 718.0, 532.0)),
+        "Times-Roman" | "Times-Italic" => Some((683.0, -217.0, 662.0, 450.0)),
+        "Times-Bold" | "Times-BoldItalic" => Some((676.0, -205.0, 676.0, 461.0)),
+        "Courier" | "Courier-Oblique" => Some((629.0, -157.0, 562.0, 426.0)),
+        "Courier-Bold" | "Courier-BoldOblique" => Some((626.0, -142.0, 562.0, 439.0)),
+        _ => None,
+    }
+}
+
+fn transform_rect(matrix: &Matrix, rect: Rect) -> Rect {
+    let corners = [
+        matrix.transform_point(rect.x, rect.y),
+        matrix.transform_point(rect.x + rect.width, rect.y),
+        matrix.transform_point(rect.x, rect.y + rect.height),
+        matrix.transform_point(rect.x + rect.width, rect.y + rect.height),
+    ];
+
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+
+    for corner in corners {
+        min_x = min_x.min(corner.x);
+        min_y = min_y.min(corner.y);
+        max_x = max_x.max(corner.x);
+        max_y = max_y.max(corner.y);
+    }
+
+    Rect::from_points(min_x, min_y, max_x, max_y).normalize()
 }
 
 /// Configuration for text extraction heuristics.
@@ -1983,10 +2340,10 @@ pub struct TextExtractor {
     /// - Tiebreaker: Only when TJ and geometric signals conflict (default)
     /// - Primary: Before creating TextSpans from tj_character_array
     word_boundary_mode: WordBoundaryMode,
-    /// Cached current font for fast lookups.
+    /// Cached current font for fast lookups and precise bbox state management.
     cached_current_font: Option<Arc<FontInfo>>,
-    /// Short history used to suppress near-duplicate glyph overprints during one extraction pass.
-    recent_plain_chars: Vec<TextChar>,
+    /// Short-lived runtime used only during a single extraction pass.
+    text_runtime: Option<TextRunRuntime>,
 }
 
 impl TextExtractor {
@@ -2044,7 +2401,7 @@ impl TextExtractor {
             current_x_position: 0.0,                     // Start at origin
             word_boundary_mode,                          // Word boundary detection mode
             cached_current_font: None,                   // Set on first Tf
-            recent_plain_chars: Vec::new(),
+            text_runtime: None,
         }
     }
 
@@ -2071,45 +2428,79 @@ impl TextExtractor {
         self
     }
 
+    fn is_resolved_mode(&self) -> bool {
+        self.text_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.resolved.is_some())
+    }
+
+    fn has_current_tight_font_metrics(&self) -> bool {
+        self.text_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.resolved.as_ref())
+            .is_some_and(|resolved| resolved.cached_current_tight_font_metrics.is_some())
+    }
+
+    fn current_tight_font_metrics_mut(&mut self) -> Option<&mut CachedTightFontMetrics> {
+        self.text_runtime
+            .as_mut()
+            .and_then(|runtime| runtime.resolved.as_mut())
+            .and_then(|resolved| resolved.cached_current_tight_font_metrics.as_mut())
+    }
+
+    fn flush_current_tight_font_metrics(&mut self) {
+        let Some(resolved) = self
+            .text_runtime
+            .as_mut()
+            .and_then(|runtime| runtime.resolved.as_mut())
+        else {
+            return;
+        };
+        if let (Some(key), Some(metrics)) = (
+            resolved.cached_current_tight_font_metrics_key.take(),
+            resolved.cached_current_tight_font_metrics.take(),
+        ) {
+            resolved.tight_font_metrics_cache.insert(key, metrics);
+        }
+    }
+
     fn set_cached_current_font(&mut self, font: Option<Arc<FontInfo>>) {
         if let (Some(current_font), Some(new_font)) =
             (self.cached_current_font.as_ref(), font.as_ref())
         {
-            if Arc::ptr_eq(current_font, new_font) {
+            if Arc::ptr_eq(current_font, new_font)
+                && (!self.is_resolved_mode() || self.has_current_tight_font_metrics())
+            {
                 return;
             }
         }
-        self.cached_current_font = font;
-    }
 
-    fn coarse_char_bbox(
-        &self,
-        origin_x: f32,
-        origin_y: f32,
-        advance_width: f32,
-        font_size: f32,
-    ) -> Rect {
-        Rect::new(origin_x, origin_y, advance_width.max(0.0), font_size.max(0.0))
-    }
+        self.flush_current_tight_font_metrics();
+        self.cached_current_font = None;
 
-    fn resolve_unicode_string(&self, font_ref: Option<&FontInfo>, char_code: u32) -> String {
-        if let Some(font) = font_ref {
-            font.char_to_unicode(char_code)
-                .unwrap_or_else(|| fallback_char_to_unicode(char_code))
-        } else if char_code < 256 && (char_code as u8).is_ascii() {
-            (char_code as u8 as char).to_string()
-        } else {
-            "?".to_string()
-        }
-    }
+        let Some(font) = font else {
+            return;
+        };
 
-    fn push_extracted_char(&mut self, text_char: TextChar, char_code: u32, dedupe_threshold: f32) {
-        if self.should_suppress_near_duplicate_char(&text_char, char_code, dedupe_threshold) {
+        if !self.is_resolved_mode() {
+            self.cached_current_font = Some(font);
             return;
         }
 
-        self.record_recent_plain_char(&text_char);
-        self.chars.push(text_char);
+        let resolved = self
+            .text_runtime
+            .as_mut()
+            .and_then(|runtime| runtime.resolved.as_mut())
+            .expect("resolved mode requires resolved runtime");
+        let key = CachedTightFontMetrics::cache_key(font.as_ref());
+        let metrics = resolved
+            .tight_font_metrics_cache
+            .remove(&key)
+            .unwrap_or_else(|| CachedTightFontMetrics::from_font(font.as_ref()));
+
+        self.cached_current_font = Some(font);
+        resolved.cached_current_tight_font_metrics_key = Some(key);
+        resolved.cached_current_tight_font_metrics = Some(metrics);
     }
 
     fn sync_cached_current_font_from_state(&mut self) {
@@ -2121,6 +2512,48 @@ impl TextExtractor {
             .and_then(|name| self.fonts.get(name))
             .cloned();
         self.set_cached_current_font(font);
+    }
+
+    fn resolve_text_space_char_bbox(
+        &mut self,
+        font: Option<&FontInfo>,
+        char_code: u32,
+        unicode_char: char,
+        advance_width: f32,
+        font_size: f32,
+        horizontal_scaling: f32,
+    ) -> Rect {
+        if let Some(font) = font {
+            let fs_factor = font_size / 1000.0;
+            let hs_factor = horizontal_scaling / 100.0;
+            let metrics = self
+                .current_tight_font_metrics_mut()
+                .expect("current tight font metrics should be loaded before bbox resolution");
+
+            if let Some(glyph_box) = metrics.glyph_box_for_pdf_char(font, char_code, unicode_char) {
+                if metrics.glyph_box_looks_reasonable(
+                    font,
+                    glyph_box,
+                    advance_width,
+                    font_size,
+                    horizontal_scaling,
+                ) {
+                    return Rect::from_points(
+                        glyph_box.x_min * fs_factor * hs_factor,
+                        glyph_box.y_min * fs_factor,
+                        glyph_box.x_max * fs_factor * hs_factor,
+                        glyph_box.y_max * fs_factor,
+                    )
+                    .normalize();
+                }
+            }
+
+            let (bottom, top) = metrics.heuristic_vertical_bounds(unicode_char);
+            let (left, right) = metrics.heuristic_horizontal_bounds(unicode_char, advance_width);
+            return Rect::from_points(left, bottom * fs_factor, right, top * fs_factor).normalize();
+        }
+
+        Rect::new(0.0, 0.0, advance_width, font_size)
     }
 
     /// Set the resources dictionary for this extractor.
@@ -2170,8 +2603,156 @@ impl TextExtractor {
         self.flush_tj_span_buffer()
     }
 
+    #[cfg(test)]
+    pub(crate) fn tight_font_metrics_cache_is_empty_for_test(&self) -> bool {
+        self.text_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.resolved.as_ref())
+            .is_none_or(|resolved| resolved.tight_font_metrics_cache.is_empty())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recent_plain_char_history_len_for_test(&self) -> usize {
+        self.text_runtime
+            .as_ref()
+            .map_or(0, |runtime| runtime.recent_plain_chars.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_active_text_runtime_for_test(&self) -> bool {
+        self.text_runtime.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolved_sequence_counter_for_test(&self) -> usize {
+        self.text_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.resolved.as_ref())
+            .map_or(0, |resolved| resolved.sequence_counter)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_resolved_runtime_for_test(&mut self) {
+        self.text_runtime = Some(TextRunRuntime::resolved());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_stale_resolved_runtime_for_test(&mut self, sequence: usize) {
+        let mut runtime = TextRunRuntime::resolved();
+        runtime
+            .resolved
+            .as_mut()
+            .expect("resolved runtime")
+            .sequence_counter = sequence;
+        self.text_runtime = Some(runtime);
+    }
+
+    fn font_is_monospace(font: Option<&FontInfo>) -> bool {
+        font.is_some_and(|font| {
+            if font.flags.is_some_and(|flags| flags & 1 != 0) {
+                return true;
+            }
+            let name = font.base_font.to_uppercase();
+            name.contains("COURIER")
+                || name.contains("CONSOLAS")
+                || name.contains("MONO")
+                || name.contains("FIXED")
+        })
+    }
+
+    fn build_resolved_style(
+        &self,
+        font_ref: Option<&FontInfo>,
+        font_size: f32,
+        font_weight: FontWeight,
+        is_italic: bool,
+        color: Color,
+    ) -> ResolvedStyle {
+        let state = self.state_stack.current();
+        ResolvedStyle {
+            font_name: font_ref
+                .map(|font| font.base_font.clone())
+                .or_else(|| state.font_name.clone())
+                .unwrap_or_default(),
+            font_size,
+            font_weight,
+            is_italic,
+            is_monospace: Self::font_is_monospace(font_ref),
+            color,
+            char_spacing: state.char_space,
+            word_spacing: state.word_space,
+            horizontal_scaling: state.horizontal_scaling,
+        }
+    }
+
+    fn prepare_char_run_context(
+        &mut self,
+        font: Option<Arc<FontInfo>>,
+        effective_font_size: f32,
+        font_weight: FontWeight,
+        is_italic: bool,
+        color: Color,
+    ) -> Option<Arc<FontInfo>> {
+        let font_ref = font.as_deref();
+        if self.is_resolved_mode() && font_ref.is_some() && !self.has_current_tight_font_metrics() {
+            self.set_cached_current_font(font.clone());
+        }
+
+        self.begin_resolved_run(font_ref, effective_font_size, font_weight, is_italic, color);
+        font
+    }
+
+    fn begin_resolved_run(
+        &mut self,
+        font_ref: Option<&FontInfo>,
+        effective_font_size: f32,
+        font_weight: FontWeight,
+        is_italic: bool,
+        color: Color,
+    ) {
+        if !self.is_resolved_mode() {
+            return;
+        }
+
+        let resolved_style =
+            self.build_resolved_style(font_ref, effective_font_size, font_weight, is_italic, color);
+        let Some(collector) = self
+            .text_runtime
+            .as_mut()
+            .and_then(|runtime| runtime.resolved.as_mut())
+            .map(|resolved| (&mut resolved.collector, &mut resolved.sequence_counter))
+        else {
+            return;
+        };
+        collector
+            .0
+            .begin_run(*collector.1, self.current_mcid, resolved_style);
+    }
+
+    fn coarse_char_bbox(
+        &self,
+        origin_x: f32,
+        origin_y: f32,
+        advance_width: f32,
+        font_size: f32,
+    ) -> Rect {
+        Rect::new(origin_x, origin_y, advance_width.max(0.0), font_size.max(0.0))
+    }
+
+    fn resolve_unicode_string(&self, font_ref: Option<&FontInfo>, char_code: u32) -> String {
+        if let Some(font) = font_ref {
+            font.char_to_unicode(char_code)
+                .unwrap_or_else(|| fallback_char_to_unicode(char_code))
+        } else if char_code < 256 && (char_code as u8).is_ascii() {
+            (char_code as u8 as char).to_string()
+        } else {
+            "?".to_string()
+        }
+    }
+
     fn push_extracted_char(&mut self, text_char: TextChar, char_code: u32, dedupe_threshold: f32) {
-        if text_char.char.is_whitespace()
+        if !self.is_resolved_mode()
+            && text_char.char.is_whitespace()
             && self
                 .chars
                 .last()
@@ -2185,13 +2766,51 @@ impl TextExtractor {
         }
 
         self.record_recent_plain_char(&text_char);
-        self.chars.push(text_char);
-    }
-    fn record_recent_plain_char(&mut self, text_char: &TextChar) {
-        if self.recent_plain_chars.len() >= 8 {
-            self.recent_plain_chars.remove(0);
+        self.push_resolved_char_if_needed(&text_char);
+        if !self.is_resolved_mode() {
+            self.chars.push(text_char);
         }
-        self.recent_plain_chars.push(text_char.clone());
+    }
+
+    fn finalize_char_run(&mut self) {
+        let Some(resolved) = self
+            .text_runtime
+            .as_mut()
+            .and_then(|runtime| runtime.resolved.as_mut())
+        else {
+            return;
+        };
+
+        if resolved.collector.finish_run() {
+            resolved.sequence_counter += 1;
+        }
+    }
+
+    fn push_resolved_char_if_needed(&mut self, text_char: &TextChar) {
+        let Some(collector) = self
+            .text_runtime
+            .as_mut()
+            .and_then(|runtime| runtime.resolved.as_mut())
+            .map(|resolved| &mut resolved.collector)
+        else {
+            return;
+        };
+
+        collector.push_char(ResolvedChar {
+            text: text_char.char,
+            bbox: text_char.bbox,
+            rotation_degrees: Some(text_char.rotation_degrees),
+        });
+    }
+
+    fn record_recent_plain_char(&mut self, text_char: &TextChar) {
+        let Some(runtime) = self.text_runtime.as_mut() else {
+            return;
+        };
+        if runtime.recent_plain_chars.len() >= 8 {
+            runtime.recent_plain_chars.remove(0);
+        }
+        runtime.recent_plain_chars.push(text_char.clone());
     }
 
     fn should_suppress_near_duplicate_char(
@@ -2204,8 +2823,11 @@ impl TextExtractor {
             return false;
         }
 
-        self.recent_plain_chars
-            .iter()
+        self.text_runtime
+            .as_ref()
+            .map(|runtime| runtime.recent_plain_chars.iter())
+            .into_iter()
+            .flatten()
             .rev()
             .take(7)
             .any(|previous| {
@@ -2734,7 +3356,7 @@ impl TextExtractor {
         // Enable span extraction mode
         self.extract_spans = true;
         self.spans.clear();
-        self.recent_plain_chars.clear();
+        self.text_runtime = Some(TextRunRuntime::plain());
         self.span_sequence_counter = 0; // Reset sequence counter for this page
 
         // Streaming parse+execute: operators are processed immediately without
@@ -2770,7 +3392,7 @@ impl TextExtractor {
 
         // Merge adjacent spans on the same line to reconstruct complete words
         self.merge_adjacent_spans();
-        self.recent_plain_chars.clear();
+        self.text_runtime = None;
 
         Ok(std::mem::take(&mut self.spans))
     }
@@ -2787,7 +3409,7 @@ impl TextExtractor {
     fn extract_chars_internal(&mut self, content_stream: &[u8]) -> Result<()> {
         // Enable character extraction mode
         self.extract_spans = false;
-        self.recent_plain_chars.clear();
+        self.text_runtime = Some(TextRunRuntime::plain());
         self.chars.clear();
         self.spans.clear(); // Ensure spans are clear so they don't poison xobject_spans_cache
 
@@ -2795,8 +3417,45 @@ impl TextExtractor {
 
         self.sort_by_reading_order();
         self.deduplicate_overlapping_chars();
-        self.recent_plain_chars.clear();
+        self.text_runtime = None;
         Ok(())
+    }
+
+    /// Extract PDF-native text runs with resolved characters and precise boxes.
+    ///
+    /// Unlike [`extract_text_spans`](Self::extract_text_spans), this keeps the
+    /// low-level run order emitted by the content stream and preserves
+    /// per-character bounding boxes inside each accepted run.
+    ///
+    /// This path deliberately stays off the normal public char pipeline:
+    /// - it does not sort by reading order
+    /// - it does not run the post-sort overlap dedup used by
+    ///   [`extract`](Self::extract)
+    /// - it does allow the local pre-sort near-duplicate suppression that
+    ///   filters almost-identical consecutive glyph emissions
+    ///
+    /// Runtime precision state is cleared before returning so later default
+    /// extraction calls keep their normal behavior.
+    pub fn extract_resolved_spans(&mut self, content_stream: &[u8]) -> Result<Vec<ResolvedSpan>> {
+        self.extract_spans = false;
+        self.text_runtime = Some(TextRunRuntime::resolved());
+        self.chars.clear();
+        self.spans.clear();
+
+        if let Err(err) = self.execute_text_only_stream(content_stream) {
+            self.chars.clear();
+            self.text_runtime = None;
+            return Err(err);
+        }
+
+        let spans = self
+            .text_runtime
+            .take()
+            .and_then(|runtime| runtime.resolved)
+            .map(|resolved| resolved.collector.into_spans())
+            .unwrap_or_default();
+        self.chars.clear();
+        Ok(spans)
     }
 
     /// Extract individual characters from a PDF content stream.
@@ -6387,7 +7046,12 @@ impl TextExtractor {
         };
 
         let total_advance: f32 = source_metrics.iter().map(|(_, advance, _)| *advance).sum();
+        let total_glyph_width: f32 = source_metrics
+            .iter()
+            .map(|(_, _, glyph_width)| *glyph_width)
+            .sum();
         let default_advance = total_advance / decoded_chars.len() as f32;
+        let default_glyph_width = total_glyph_width / decoded_chars.len() as f32;
 
         let combined_char = text_matrix.multiply(&ctm);
         let effective_font_size = font_size
@@ -6411,6 +7075,13 @@ impl TextExtractor {
         let color = Color::new(r, g, b);
         let final_matrix = text_matrix.multiply(&ctm);
         let rotation_degrees = final_matrix.b.atan2(final_matrix.a).to_degrees();
+        let font = self.prepare_char_run_context(
+            font,
+            effective_font_size,
+            font_weight,
+            is_italic_char,
+            color,
+        );
         let font_ref = font.as_deref();
 
         let source_len_matches = source_metrics.len() == decoded_chars.len();
@@ -6430,18 +7101,37 @@ impl TextExtractor {
             } else {
                 default_advance
             };
+            let glyph_width_for_bbox = if source_len_matches {
+                source_metrics[index].2
+            } else {
+                default_glyph_width
+            };
+
             let char_origin = final_matrix.transform_point(x_offset_user, 0.0);
             let next_origin = final_matrix.transform_point(x_offset_user + advance_for_char, 0.0);
             let advance_width = ((next_origin.x - char_origin.x).powi(2)
                 + (next_origin.y - char_origin.y).powi(2))
             .sqrt();
 
-            let bbox = self.coarse_char_bbox(
-                char_origin.x,
-                char_origin.y,
-                advance_width,
-                effective_font_size,
-            );
+            let bbox = if self.is_resolved_mode() {
+                let mut text_space_bbox = self.resolve_text_space_char_bbox(
+                    font_ref,
+                    char_code,
+                    unicode_char,
+                    glyph_width_for_bbox,
+                    font_size,
+                    horizontal_scaling,
+                );
+                text_space_bbox.x += x_offset_user;
+                transform_rect(&final_matrix, text_space_bbox)
+            } else {
+                self.coarse_char_bbox(
+                    char_origin.x,
+                    char_origin.y,
+                    advance_width,
+                    effective_font_size,
+                )
+            };
 
             let text_char = TextChar {
                 char: unicode_char,
@@ -6472,6 +7162,7 @@ impl TextExtractor {
             x_offset_user += advance_for_char;
         }
 
+        self.finalize_char_run();
         Ok(())
     }
 
@@ -6498,6 +7189,28 @@ impl TextExtractor {
 
         // Get current font from cached reference
         let font = self.cached_current_font.clone();
+        let font_ref = font.as_deref();
+        let initial_text_matrix = self.state_stack.current().text_matrix;
+        let initial_combined_char = initial_text_matrix.multiply(&ctm);
+        let initial_effective_font_size = font_size
+            * (initial_combined_char.d * initial_combined_char.d
+                + initial_combined_char.b * initial_combined_char.b)
+                .sqrt();
+        let initial_font_weight = if font_ref.is_some_and(|font| font.is_bold()) {
+            FontWeight::Bold
+        } else {
+            FontWeight::Normal
+        };
+        let initial_is_italic = font_ref.is_some_and(|font| font.is_italic());
+        let (r, g, b) = fill_color_rgb;
+        let initial_color = Color::new(r, g, b);
+        let font = self.prepare_char_run_context(
+            font,
+            initial_effective_font_size,
+            initial_font_weight,
+            initial_is_italic,
+            initial_color,
+        );
         let font_ref = font.as_deref();
 
         for (char_code, _) in TextCharIter::new(text, font_ref) {
@@ -6570,12 +7283,25 @@ impl TextExtractor {
                 let advance_width = ((next_origin.x - char_origin.x).powi(2)
                     + (next_origin.y - char_origin.y).powi(2))
                 .sqrt();
-                let bbox = self.coarse_char_bbox(
-                    char_origin.x,
-                    char_origin.y,
-                    advance_width,
-                    effective_font_size,
-                );
+                let bbox = if self.is_resolved_mode() {
+                    let mut text_space_bbox = self.resolve_text_space_char_bbox(
+                        font_ref,
+                        char_code as u32,
+                        unicode_char,
+                        char_width_user,
+                        font_size,
+                        horizontal_scaling,
+                    );
+                    text_space_bbox.x += x_offset_user;
+                    transform_rect(&final_matrix, text_space_bbox)
+                } else {
+                    self.coarse_char_bbox(
+                        char_origin.x,
+                        char_origin.y,
+                        advance_width,
+                        effective_font_size,
+                    )
+                };
 
                 let text_char = TextChar {
                     char: unicode_char,
@@ -6617,6 +7343,8 @@ impl TextExtractor {
             state_mut.text_matrix.e += tx * tm.a;
             state_mut.text_matrix.f += tx * tm.b;
         }
+
+        self.finalize_char_run();
 
         Ok(())
     }
@@ -6687,7 +7415,9 @@ impl Default for TextExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fonts::{Encoding, LazyCMap};
+    use crate::fonts::{Encoding, LazyCMap, TrueTypeCMap};
+    use byteorder::{BigEndian, WriteBytesExt};
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     fn create_test_font() -> FontInfo {
@@ -6763,6 +7493,24 @@ mod tests {
         assert_eq!(chars[1].char, 'i');
         // Position should be around (100, 700)
         assert!(chars[0].bbox.x >= 99.0 && chars[0].bbox.x <= 101.0);
+    }
+
+    #[test]
+    fn extract_resolved_spans_preserves_pdf_run_order() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let stream = b"BT /F1 12 Tf 100 700 Td (AB) Tj 0 -20 Td (CD) Tj ET";
+        let spans = extractor.extract_resolved_spans(stream).unwrap();
+
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].sequence, 0);
+        assert_eq!(spans[0].text, "AB");
+        assert_eq!(spans[0].chars.iter().map(|ch| ch.text).collect::<String>(), "AB");
+        assert_eq!(spans[1].sequence, 1);
+        assert_eq!(spans[1].text, "CD");
+        assert_eq!(spans[1].chars.iter().map(|ch| ch.text).collect::<String>(), "CD");
     }
 
     /// Regression test for Issue #11: CTM must be applied to text positions
@@ -6948,6 +7696,67 @@ mod tests {
         );
     }
 
+    fn load_test_font_data(name: &str) -> Option<Vec<u8>> {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let candidates = [
+            format!("{manifest}/tests/fixtures/fonts/{name}"),
+            format!("/usr/share/fonts/truetype/dejavu/{name}"),
+            format!("/usr/share/fonts/dejavu-sans-fonts/{name}"),
+            format!("/usr/share/fonts/TTF/{name}"),
+        ];
+        for path in &candidates {
+            if let Ok(data) = std::fs::read(path) {
+                return Some(data);
+            }
+        }
+        None
+    }
+
+    fn sample_pdf_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../samples/pdf")
+            .join(name)
+    }
+
+    fn bench_pdf_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../.source-cache/opendataloader-bench/pdfs")
+            .join(name)
+    }
+
+    fn build_truetype_with_cmap_format0(mappings: &[(u8, u8)]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.write_u32::<BigEndian>(0x00010000).unwrap();
+        data.write_u16::<BigEndian>(1).unwrap();
+        data.write_u16::<BigEndian>(16).unwrap();
+        data.write_u16::<BigEndian>(0).unwrap();
+        data.write_u16::<BigEndian>(0).unwrap();
+
+        let cmap_offset: u32 = 12 + 16;
+        data.write_u32::<BigEndian>(0x636D6170).unwrap();
+        data.write_u32::<BigEndian>(0).unwrap();
+        data.write_u32::<BigEndian>(cmap_offset).unwrap();
+        data.write_u32::<BigEndian>(0).unwrap();
+
+        data.write_u16::<BigEndian>(0).unwrap();
+        data.write_u16::<BigEndian>(1).unwrap();
+        data.write_u16::<BigEndian>(1).unwrap();
+        data.write_u16::<BigEndian>(0).unwrap();
+        data.write_u32::<BigEndian>(4 + 8).unwrap();
+
+        data.write_u16::<BigEndian>(0).unwrap();
+        data.write_u16::<BigEndian>(262).unwrap();
+        data.write_u16::<BigEndian>(0).unwrap();
+
+        let mut glyph_id_array = [0u8; 256];
+        for &(char_code, gid) in mappings {
+            glyph_id_array[char_code as usize] = gid;
+        }
+        data.extend_from_slice(&glyph_id_array);
+
+        data
+    }
+
     #[test]
     fn test_extract_collapses_consecutive_explicit_spaces_like_pdfium() {
         let mut extractor = TextExtractor::new();
@@ -6977,6 +7786,66 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_resolved_spans_suppress_near_duplicate_glyphs_without_sorting() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let spans = extractor
+            .extract_resolved_spans(
+                b"BT /F1 12 Tf 1 0 0 1 100 700 Tm (A) Tj 1 0 0 1 100 700 Tm (A) Tj ET",
+            )
+            .unwrap();
+
+        let text = spans
+            .iter()
+            .flat_map(|span| span.chars.iter())
+            .map(|ch| ch.text)
+            .collect::<String>();
+        let sequences = spans.iter().map(|span| span.sequence).collect::<Vec<_>>();
+
+        assert_eq!(text, "A");
+        assert_eq!(sequences, vec![0]);
+    }
+
+    #[test]
+    fn test_extract_resolved_spans_do_not_insert_synthetic_tj_spaces() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let spans = extractor
+            .extract_resolved_spans(b"BT /F1 12 Tf 100 700 Td [(Hello) -500 (World)] TJ ET")
+            .unwrap();
+        let text = spans
+            .iter()
+            .flat_map(|span| span.chars.iter())
+            .map(|ch| ch.text)
+            .collect::<String>();
+
+        assert_eq!(text, "HelloWorld");
+    }
+
+    #[test]
+    fn test_extract_resolved_spans_do_not_insert_spaces_between_separate_runs() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let spans = extractor
+            .extract_resolved_spans(b"BT /F1 12 Tf 100 700 Td (A) Tj 40 0 Td (B) Tj ET")
+            .unwrap();
+        let text = spans
+            .iter()
+            .flat_map(|span| span.chars.iter())
+            .map(|ch| ch.text)
+            .collect::<String>();
+
+        assert_eq!(text, "AB");
+        assert_eq!(spans.len(), 2);
+    }
+
+    #[test]
     fn test_extract_collapses_consecutive_explicit_spaces_in_character_view() {
         let mut extractor = TextExtractor::new();
         let font = create_test_font();
@@ -6988,6 +7857,153 @@ mod tests {
 
         let text = chars.iter().map(|ch| ch.char).collect::<String>();
         assert_eq!(text, "A B");
+    }
+
+    #[test]
+    fn test_type0_cidfont_uses_char_code_to_resolve_glyph_box() {
+        let Some(font_data) = load_test_font_data("DejaVuSans.ttf") else {
+            return;
+        };
+
+        let mut font = create_test_font();
+        font.base_font = "SubsetType0".to_string();
+        font.subtype = "Type0".to_string();
+        font.encoding = Encoding::Standard("Identity-H".to_string());
+        font.cid_font_type = Some("CIDFontType2".to_string());
+        font.cid_to_gid_map = Some(crate::fonts::CIDToGIDMap::Identity);
+        font.is_truetype_font = true;
+        font.embedded_font_data = Some(Arc::new(font_data));
+
+        let glyph_box = CachedTightFontMetrics::from_font(&font)
+            .glyph_box_for_pdf_char(&font, '2' as u32, '中');
+
+        assert!(
+            glyph_box.is_some(),
+            "type0 CIDFontType2 glyph bbox lookup should use CID/GID mapping even when unicode glyph lookup would miss"
+        );
+    }
+
+    #[test]
+    fn test_type0_cidfonttype0_uses_unicode_fallback_when_embedded_face_is_available() {
+        let Some(font_data) = load_test_font_data("DejaVuSans.ttf") else {
+            return;
+        };
+
+        let mut font = create_test_font();
+        font.base_font = "SubsetCIDFont-NoSystemFallback".to_string();
+        font.subtype = "Type0".to_string();
+        font.encoding = Encoding::Standard("Identity-H".to_string());
+        font.cid_font_type = Some("CIDFontType0".to_string());
+        font.is_truetype_font = false;
+        font.embedded_font_data = Some(Arc::new(font_data));
+
+        let glyph_box =
+            CachedTightFontMetrics::from_font(&font).glyph_box_for_pdf_char(&font, 0x1234, '2');
+
+        assert!(
+            glyph_box.is_some(),
+            "type0 CIDFontType0 glyph bbox lookup should still work through unicode fallback when embedded face data is available"
+        );
+    }
+
+    #[test]
+    fn test_type0_cidfonttype0_uses_char_code_when_unicode_lookup_is_unavailable() {
+        let Some(font_data) = load_test_font_data("DejaVuSans.ttf") else {
+            return;
+        };
+
+        let mut font = create_test_font();
+        font.base_font = "SubsetCIDFont-NoUnicode".to_string();
+        font.subtype = "Type0".to_string();
+        font.encoding = Encoding::Standard("Identity-H".to_string());
+        font.cid_font_type = Some("CIDFontType0".to_string());
+        font.is_truetype_font = false;
+        font.embedded_font_data = Some(Arc::new(font_data));
+
+        let glyph_box = CachedTightFontMetrics::from_font(&font)
+            .glyph_box_for_pdf_char(&font, '2' as u32, '\u{E000}');
+
+        assert!(
+            glyph_box.is_some(),
+            "type0 CIDFontType0 glyph bbox lookup should still work through char-code mapping when unicode lookup is unavailable"
+        );
+    }
+
+    #[test]
+    fn test_simple_truetype_uses_char_code_mapping_when_unicode_lookup_is_unavailable() {
+        let Some(font_data) = load_test_font_data("DejaVuSans.ttf") else {
+            return;
+        };
+
+        let mut font = create_test_font();
+        font.base_font = "SubsetSimpleTrueType".to_string();
+        font.subtype = "TrueType".to_string();
+        font.encoding = Encoding::Standard("SymbolicBuiltIn".to_string());
+        font.is_truetype_font = true;
+        font.embedded_font_data = Some(Arc::new(font_data));
+
+        let gid_a = font
+            .parsed_face()
+            .and_then(|face| face.as_ref().as_face_ref().glyph_index('A'))
+            .map(|gid| gid.0)
+            .expect("DejaVuSans should contain glyph for 'A'");
+        assert!(gid_a <= u8::MAX as u16, "test cmap format 0 only supports u8 gids");
+
+        let cmap =
+            TrueTypeCMap::from_font_data(&build_truetype_with_cmap_format0(&[(1, gid_a as u8)]))
+                .expect("format 0 cmap should parse");
+        font.set_truetype_cmap(Some(cmap));
+
+        let glyph_box =
+            CachedTightFontMetrics::from_font(&font).glyph_box_for_pdf_char(&font, 1, '\u{E000}');
+
+        assert!(
+            glyph_box.is_some(),
+            "simple TrueType glyph bbox lookup should still work through char-code mapping when unicode lookup is unavailable"
+        );
+    }
+
+    #[test]
+    fn test_tight_font_metrics_cache_distinguishes_fonts_with_same_base_name() {
+        let Some(font_data) = load_test_font_data("DejaVuSans.ttf") else {
+            return;
+        };
+
+        let mut type0_font = create_test_font();
+        type0_font.base_font = "ABCDEE+ËÎÌå".to_string();
+        type0_font.subtype = "Type0".to_string();
+        type0_font.encoding = Encoding::Standard("Identity-H".to_string());
+        type0_font.cid_font_type = Some("CIDFontType2".to_string());
+        type0_font.cid_to_gid_map = Some(crate::fonts::CIDToGIDMap::Identity);
+
+        let mut truetype_font = create_test_font();
+        truetype_font.base_font = "ABCDEE+ËÎÌå".to_string();
+        truetype_font.subtype = "TrueType".to_string();
+        truetype_font.encoding = Encoding::Standard("WinAnsiEncoding".to_string());
+        truetype_font.is_truetype_font = true;
+        truetype_font.embedded_font_data = Some(Arc::new(font_data));
+
+        let type0_key = CachedTightFontMetrics::cache_key(&type0_font);
+        let truetype_key = CachedTightFontMetrics::cache_key(&truetype_font);
+        assert_ne!(
+            type0_key, truetype_key,
+            "cache key must distinguish fonts that share the same base font name"
+        );
+
+        let mut extractor = TextExtractor::new();
+        extractor.install_resolved_runtime_for_test();
+        extractor.set_cached_current_font(Some(Arc::new(type0_font)));
+        extractor.set_cached_current_font(Some(Arc::new(truetype_font.clone())));
+
+        let truetype_box = extractor
+            .current_tight_font_metrics_mut()
+            .expect("truetype font should load its own tight metrics")
+            .glyph_box_for_pdf_char(&truetype_font, '2' as u32, '2');
+
+        assert!(
+            truetype_box.is_some(),
+            "truetype font with embedded data should still resolve a glyph box after caching a type0 font with the same base name first"
+        );
     }
 
     #[test]
@@ -7010,6 +8026,25 @@ mod tests {
         assert!(
             chars[0].bbox.width > 0.0,
             "emitted placeholder char should preserve a drawable bbox"
+        );
+
+        let mut resolved_extractor = TextExtractor::new();
+        let mut resolved_font = create_test_font();
+        let mut resolved_custom = HashMap::new();
+        resolved_custom.insert(0x41u8, '\u{008F}');
+        resolved_font.encoding = Encoding::Custom(resolved_custom);
+        resolved_extractor.add_font("F1".to_string(), resolved_font);
+        let spans = resolved_extractor
+            .extract_resolved_spans(stream)
+            .expect("extract resolved spans");
+        let resolved_chars = spans
+            .iter()
+            .flat_map(|span| span.chars.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resolved_chars.len(),
+            1,
+            "resolved extraction should preserve glyph boxes even when Unicode fallback is a control char"
         );
     }
 
@@ -7177,6 +8212,117 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_resolved_spans_keep_precise_descender_boxes_for_standard_fonts() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let stream = b"BT /F1 12 Tf 100 700 Td (Ag) Tj ET";
+        let spans = extractor.extract_resolved_spans(stream).unwrap();
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].chars.len(), 2);
+
+        let uppercase = &spans[0].chars[0];
+        assert_eq!(uppercase.text, 'A');
+        assert!(
+            uppercase.bbox.height < spans[0].style.font_size,
+            "resolved bbox for 'A' should stay tight: bbox={:?}, font_size={}",
+            uppercase.bbox,
+            spans[0].style.font_size
+        );
+
+        let descender = &spans[0].chars[1];
+        assert_eq!(descender.text, 'g');
+        assert!(
+            descender.bbox.height < spans[0].style.font_size,
+            "resolved bbox for 'g' should stay tighter than the font box: bbox={:?}, font_size={}",
+            descender.bbox,
+            spans[0].style.font_size
+        );
+        assert!(
+            descender.bbox.y < uppercase.bbox.y + uppercase.bbox.height,
+            "resolved descender bbox should extend lower than the uppercase glyph box: upper={:?}, descender={:?}",
+            uppercase.bbox,
+            descender.bbox
+        );
+    }
+
+    #[test]
+    fn test_extract_does_not_warm_tight_font_metrics_cache() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let _ = extractor
+            .extract(b"BT /F1 12 Tf 100 700 Td (A) Tj ET")
+            .unwrap();
+
+        assert!(
+            !extractor.has_current_tight_font_metrics(),
+            "plain extract() should not keep tight metrics warm"
+        );
+        assert!(
+            extractor.tight_font_metrics_cache_is_empty_for_test(),
+            "plain extract() should not populate the shared tight metrics cache"
+        );
+    }
+
+    #[test]
+    fn test_extract_resolved_spans_clears_precision_runtime_state_after_return() {
+        let mut extractor = TextExtractor::new();
+        extractor.add_font("F1".to_string(), create_test_font());
+
+        let spans = extractor
+            .extract_resolved_spans(b"BT /F1 12 Tf 100 700 Td (AB) Tj ET")
+            .unwrap();
+
+        assert_eq!(spans.len(), 1);
+        assert!(
+            !extractor.has_current_tight_font_metrics(),
+            "extract_resolved_spans() should not retain the active tight metrics entry after returning"
+        );
+        assert!(
+            extractor.tight_font_metrics_cache_is_empty_for_test(),
+            "extract_resolved_spans() should not retain the tight metrics cache after returning"
+        );
+        assert!(
+            extractor.chars.is_empty(),
+            "extract_resolved_spans() should not retain plain character records after returning"
+        );
+        assert!(
+            extractor.recent_plain_char_history_len_for_test() == 0,
+            "extract_resolved_spans() should not retain local duplicate-suppression history after returning"
+        );
+        assert!(
+            !extractor.has_active_text_runtime_for_test(),
+            "extract_resolved_spans() should detach its transient extraction runtime after returning"
+        );
+        assert_eq!(extractor.resolved_sequence_counter_for_test(), 0);
+    }
+
+    #[test]
+    fn test_extract_clears_stale_resolved_collector_before_plain_char_extraction() {
+        let mut extractor = TextExtractor::new();
+        extractor.add_font("F1".to_string(), create_test_font());
+
+        // Simulate a failed extract_resolved_spans() call that left its collector attached.
+        extractor.install_stale_resolved_runtime_for_test(99);
+
+        let chars = extractor
+            .extract(b"BT /F1 12 Tf 100 700 Td (CD) Tj ET")
+            .unwrap();
+        let text = chars.iter().map(|ch| ch.char).collect::<String>();
+
+        assert_eq!(text, "CD");
+        assert!(
+            !extractor.has_active_text_runtime_for_test(),
+            "plain char extraction should clear any stale transient extraction runtime before running"
+        );
+        assert_eq!(extractor.resolved_sequence_counter_for_test(), 0);
+    }
+
+    #[test]
     fn test_extract_text_spans_preserve_character_widths() {
         let mut extractor = TextExtractor::new();
         let font = create_test_font();
@@ -7203,6 +8349,88 @@ mod tests {
         let text = chars.iter().map(|ch| ch.char).collect::<String>();
 
         assert_eq!(text, "ga");
+    }
+
+    #[test]
+    fn test_resolve_text_space_char_bbox_rejects_unreasonable_glyph_boxes() {
+        let mut extractor = TextExtractor::new();
+        let mut font = create_test_font();
+        font.base_font = "WeirdFont".to_string();
+        font.subtype = "Type0".to_string();
+        font.cid_font_type = Some("CIDFontType2".to_string());
+        extractor.add_font("F1".to_string(), font.clone());
+
+        extractor.install_resolved_runtime_for_test();
+        extractor.set_cached_current_font(extractor.fonts.get("F1").cloned());
+        let metrics = extractor
+            .current_tight_font_metrics_mut()
+            .expect("current tight font metrics");
+        metrics.glyph_boxes.insert(
+            'A' as u16,
+            Some(GlyphBox1000 {
+                x_min: 0.0,
+                y_min: -5000.0,
+                x_max: 600.0,
+                y_max: 5000.0,
+            }),
+        );
+
+        let bbox =
+            extractor.resolve_text_space_char_bbox(Some(&font), 'A' as u32, 'A', 7.2, 12.0, 100.0);
+
+        assert!(
+            bbox.height < 20.0,
+            "suspicious glyph bbox should fall back to heuristic bounds instead of keeping a 120pt box: {bbox:?}"
+        );
+    }
+
+    #[test]
+    fn test_heuristic_vertical_bounds_contract_nominal_tops() {
+        let metrics = CachedTightFontMetrics::from_font(&create_test_font());
+
+        let (_, uppercase_top) = metrics.heuristic_vertical_bounds('A');
+        let (_, lowercase_top) = metrics.heuristic_vertical_bounds('a');
+        let (_, ascender_top) = metrics.heuristic_vertical_bounds('t');
+
+        assert!(
+            uppercase_top < metrics.cap_height,
+            "uppercase heuristic top should contract below raw cap height"
+        );
+        assert!(
+            lowercase_top < metrics.x_height,
+            "lowercase heuristic top should contract below raw x-height"
+        );
+        assert!(
+            ascender_top < metrics.ascender,
+            "ascender heuristic top should contract below raw ascender"
+        );
+    }
+
+    #[test]
+    fn test_heuristic_vertical_bounds_for_whitespace_are_low_but_nonzero() {
+        let metrics = CachedTightFontMetrics::from_font(&create_test_font());
+
+        let (bottom, top) = metrics.heuristic_vertical_bounds(' ');
+
+        assert_eq!(bottom, 0.0);
+        assert_eq!(top, 1.0);
+    }
+
+    #[test]
+    fn test_heuristic_horizontal_bounds_contract_dots_and_commas() {
+        let metrics = CachedTightFontMetrics::from_font(&create_test_font());
+        let advance_width = 500.0;
+
+        let (dot_left, dot_right) = metrics.heuristic_horizontal_bounds('.', advance_width);
+        let (comma_left, comma_right) = metrics.heuristic_horizontal_bounds(',', advance_width);
+        let (letter_left, letter_right) = metrics.heuristic_horizontal_bounds('A', advance_width);
+
+        assert_eq!(dot_left, 65.0);
+        assert_eq!(dot_right, 185.0);
+        assert_eq!(comma_left, 55.0);
+        assert_eq!(comma_right, 190.0);
+        assert_eq!(letter_left, 0.0);
+        assert_eq!(letter_right, advance_width);
     }
 
     #[test]

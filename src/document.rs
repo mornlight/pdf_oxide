@@ -7006,8 +7006,7 @@ impl PdfDocument {
         // Get spans with the requested reading order
         let spans = self.extract_spans_with_reading_order(page_index, reading_order)?;
 
-        // Derive chars from spans (uses char_widths for accurate positioning)
-        let chars: Vec<crate::layout::TextChar> = spans.iter().flat_map(|s| s.to_chars()).collect();
+        let chars: Vec<_> = spans.iter().flat_map(|span| span.to_chars()).collect();
 
         // Get page dimensions from MediaBox
         let media_box = self.get_page_media_box(page_index)?;
@@ -7018,6 +7017,91 @@ impl PdfDocument {
             page_width: media_box.2,
             page_height: media_box.3,
         })
+    }
+
+    /// Extract PDF-native text runs with resolved characters from a page.
+    ///
+    /// This API is the high-precision extraction surface for downstream
+    /// consumers that need PDF-native run order together with per-character
+    /// resolved bounding boxes. Unlike [`extract_spans`](Self::extract_spans),
+    /// it does not apply reading-order sorting or span regrouping.
+    ///
+    /// The returned spans:
+    /// - preserve the natural order of accepted PDF text runs
+    /// - keep per-character bounding boxes in each span's `chars`
+    /// - rebuild `ResolvedSpan::bbox` from the union of those char boxes
+    ///
+    /// The resolved pipeline may still suppress immediately adjacent
+    /// near-duplicate glyph emissions when they represent the same rendered
+    /// glyph, but it does not run the public `extract_chars()` reading-order
+    /// sort and post-sort overlap dedup pass.
+    ///
+    /// This method does not change the behavior of [`extract_spans`](Self::extract_spans),
+    /// [`extract_chars`](Self::extract_chars), or [`extract_page_text`](Self::extract_page_text).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use pdf_oxide::document::PdfDocument;
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut doc = PdfDocument::open("document.pdf")?;
+    /// let spans = doc.extract_resolved_spans(0)?;
+    /// for span in spans {
+    ///     println!("#{} {}", span.sequence, span.text);
+    ///     for ch in span.chars {
+    ///         println!("  {} {:?}", ch.text, ch.bbox);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn extract_resolved_spans(
+        &mut self,
+        page_index: usize,
+    ) -> Result<Vec<crate::layout::ResolvedSpan>> {
+        use crate::extractors::TextExtractor;
+
+        let page = self.get_page(page_index)?;
+        let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
+            offset: 0,
+            reason: "Page is not a dictionary".to_string(),
+        })?;
+
+        if self.page_cannot_have_text(page_dict) {
+            return Ok(Vec::new());
+        }
+
+        let content_data = match self.get_page_content_data(page_index) {
+            Ok(data) => data,
+            Err(e) => {
+                log::warn!(
+                    "Failed to decode content stream for page {}: {}, returning empty",
+                    page_index,
+                    e
+                );
+                return Ok(Vec::new());
+            },
+        };
+
+        if !Self::may_contain_text(&content_data) {
+            return Ok(Vec::new());
+        }
+
+        let mut extractor = TextExtractor::new();
+        if let Some(resources) = page_dict.get("Resources") {
+            extractor.set_resources(resources.clone());
+            extractor.set_document(self as *const PdfDocument);
+
+            if let Err(e) = self.load_fonts(resources, &mut extractor) {
+                log::warn!(
+                    "Failed to load fonts for page {}: {}, continuing with defaults",
+                    page_index,
+                    e
+                );
+            }
+        }
+
+        extractor.extract_resolved_spans(&content_data)
     }
 
     /// Extract text spans from a page with custom configuration.
@@ -7055,19 +7139,16 @@ impl PdfDocument {
     ) -> Result<Vec<crate::layout::TextSpan>> {
         use crate::extractors::TextExtractor;
 
-        // Get page object
         let page = self.get_page(page_index)?;
         let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
             offset: 0,
             reason: "Page is not a dictionary".to_string(),
         })?;
 
-        // Fast pre-check: skip image-only pages before decompression
         if self.page_cannot_have_text(page_dict) {
             return Ok(Vec::new());
         }
 
-        // Get content stream data — skip page on decode failure (Annex I)
         let content_data = match self.get_page_content_data(page_index) {
             Ok(data) => data,
             Err(e) => {
@@ -7080,20 +7161,15 @@ impl PdfDocument {
             },
         };
 
-        // Early-out for pages with no text content (§9.4.3)
         if !Self::may_contain_text(&content_data) {
             return Ok(Vec::new());
         }
 
-        // Create text extractor with merged configuration
         let mut extractor = TextExtractor::new().with_merging_config(config);
-
-        // Load fonts from page resources and set resources for XObject access
         if let Some(resources) = page_dict.get("Resources") {
             extractor.set_resources(resources.clone());
             extractor.set_document(self as *const PdfDocument);
 
-            // Load fonts
             if let Err(e) = self.load_fonts(resources, &mut extractor) {
                 log::warn!(
                     "Failed to load fonts for page {}: {}, continuing with defaults",
@@ -7103,7 +7179,6 @@ impl PdfDocument {
             }
         }
 
-        // Extract text spans
         extractor.extract_text_spans(&content_data)
     }
 
@@ -15235,6 +15310,44 @@ mod tests {
         let page_text = doc.extract_page_text(0).unwrap();
         assert!((page_text.page_width - 612.0).abs() < 0.1);
         assert!((page_text.page_height - 792.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_extract_resolved_spans_blank_page() {
+        let pdf = build_minimal_pdf(b"");
+        let mut doc = PdfDocument::from_bytes(pdf).unwrap();
+
+        let spans = doc.extract_resolved_spans(0).unwrap();
+
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn test_extract_resolved_spans_skips_pages_without_text_capable_resources() {
+        let content = b"BT /F1 12 Tf 72 700 Td (Hello) Tj ET";
+        let resources = b"<< /XObject << /Im1 << /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >> >> >>";
+        let pdf = build_minimal_pdf_with_page_resources(content, resources);
+        let mut doc = PdfDocument::from_bytes(pdf).unwrap();
+
+        let page = doc.get_page(0).unwrap();
+        let page_dict = page.as_dict().unwrap();
+        assert!(
+            doc.page_cannot_have_text(page_dict),
+            "image-only resources should let extract_resolved_spans() fast-skip the page"
+        );
+
+        let spans = doc.extract_resolved_spans(0).unwrap();
+        assert!(
+            spans.is_empty(),
+            "extract_resolved_spans() should honor page_cannot_have_text() and skip pages without font resources"
+        );
+    }
+
+    #[test]
+    fn test_extract_resolved_spans_out_of_bounds() {
+        let pdf = build_minimal_pdf(b"");
+        let mut doc = PdfDocument::from_bytes(pdf).unwrap();
+        assert!(doc.extract_resolved_spans(999).is_err());
     }
 
     #[test]
