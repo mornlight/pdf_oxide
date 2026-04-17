@@ -11,6 +11,7 @@ pub mod images;
 pub mod page_labels;
 pub mod paths;
 pub mod pattern_detector;
+pub(crate) mod resolved_builder;
 pub mod structured;
 pub mod synthetic_structure;
 pub mod text;

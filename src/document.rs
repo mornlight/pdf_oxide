@@ -8093,16 +8093,19 @@ impl PdfDocument {
         self.require_authenticated()?;
         use crate::extractors::TextExtractor;
 
+        // Get page object
         let page = self.get_page(page_index)?;
         let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
             offset: 0,
             reason: "Page is not a dictionary".to_string(),
         })?;
 
+        // Fast pre-check: skip pages that cannot produce text based on resources alone.
         if self.page_cannot_have_text(page_dict) {
             return Ok(Vec::new());
         }
 
+        // Get content stream data — skip page on decode failure (Annex I)
         let content_data = match self.get_page_content_data(page_index) {
             Ok(data) => data,
             Err(e) => {
@@ -8403,6 +8406,70 @@ impl PdfDocument {
     pub fn extract_chars(&self, page_index: usize) -> Result<Vec<crate::layout::TextChar>> {
         use crate::extractors::TextExtractor;
 
+        // Get page object
+        let page = self.get_page(page_index)?;
+        let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
+            offset: 0,
+            reason: "Page is not a dictionary".to_string(),
+        })?;
+
+        if self.page_cannot_have_text(page_dict) {
+            return Ok(Vec::new());
+        }
+
+        // Get content stream data — skip page on decode failure (Annex I)
+        let content_data = match self.get_page_content_data(page_index) {
+            Ok(data) => data,
+            Err(e) => {
+                log::warn!(
+                    "Failed to decode content stream for page {}: {}, returning empty",
+                    page_index,
+                    e
+                );
+                return Ok(Vec::new());
+            },
+        };
+
+        // Early-out for pages with no text content (§9.4.3)
+        if !Self::may_contain_text(&content_data) {
+            return Ok(Vec::new());
+        }
+
+        // Create text extractor for character-level extraction
+        let mut extractor = TextExtractor::new();
+
+        // Load fonts from page resources and set resources for XObject access
+        if let Some(resources) = page_dict.get("Resources") {
+            extractor.set_resources(resources.clone());
+            extractor.set_document(self as *const PdfDocument);
+
+            // Load fonts
+            if let Err(e) = self.load_fonts(resources, &mut extractor) {
+                log::warn!(
+                    "Failed to load fonts for page {}: {}, continuing with defaults",
+                    page_index,
+                    e
+                );
+            }
+        }
+
+        // Character extraction keeps the public reading-order behavior expected by
+        // the upstream API while relying on the extractor's updated low-level path.
+        extractor.extract(&content_data)
+    }
+
+    /// Extract PDF-native text runs with resolved characters from a page.
+    ///
+    /// This API preserves the accepted PDF text run order while exposing
+    /// per-character resolved bounding boxes. It does not apply public
+    /// reading-order sorting or the post-sort overlap dedup used by
+    /// [`extract_chars`](Self::extract_chars).
+    pub fn extract_resolved_spans(
+        &mut self,
+        page_index: usize,
+    ) -> Result<Vec<crate::layout::ResolvedSpan>> {
+        use crate::extractors::TextExtractor;
+
         let page = self.get_page(page_index)?;
         let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
             offset: 0,
@@ -8433,7 +8500,6 @@ impl PdfDocument {
         if let Some(resources) = page_dict.get("Resources") {
             extractor.set_resources(resources.clone());
             extractor.set_document(self);
-
             if let Err(e) = self.load_fonts(resources, &mut extractor) {
                 log::warn!(
                     "Failed to load fonts for page {}: {}, continuing with defaults",
@@ -8443,9 +8509,7 @@ impl PdfDocument {
             }
         }
 
-        // Character extraction keeps the public reading-order behavior expected by
-        // the upstream API.
-        extractor.extract(&content_data)
+        extractor.extract_resolved_spans(&content_data)
     }
 
     /// Extract words from a page.
@@ -13295,7 +13359,6 @@ mod tests {
 
         pdf
     }
-
     /// Build a minimal PDF with a single standard Type1 font resource named /F1.
     fn build_minimal_text_pdf(content: &[u8]) -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
@@ -13840,7 +13903,6 @@ mod tests {
         let chars = doc.extract_chars(0).unwrap();
         assert!(chars.is_empty());
     }
-
     #[test]
     fn test_extract_chars_skips_pages_without_text_capable_resources() {
         let content = b"BT /F1 12 Tf 72 700 Td (Hello) Tj ET";
