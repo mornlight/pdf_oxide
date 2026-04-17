@@ -5,16 +5,20 @@
 //! most accurate character-to-Unicode mapping.
 
 use super::adobe_glyph_list::ADOBE_GLYPH_LIST;
-use super::glyph_backend::{self, ParsedFaceSource};
+use super::glyph_backend;
 use crate::document::PdfDocument;
 use crate::error::{Error, Result};
 use crate::fonts::cmap::LazyCMap;
 use crate::fonts::TrueTypeCMap;
 use crate::layout::text_block::FontWeight;
 use crate::object::Object;
-use owned_ttf_parser::OwnedFace;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+#[cfg(test)]
+use super::glyph_backend::ParsedFaceSource;
+#[cfg(test)]
+use owned_ttf_parser::OwnedFace;
 
 /// Font information extracted from a PDF font dictionary.
 #[derive(Debug, Clone)]
@@ -260,6 +264,7 @@ impl FontInfo {
     }
 
     /// Return the lazily-parsed embedded TrueType/OpenType face, if available.
+    #[cfg(test)]
     pub(crate) fn parsed_face_with_source(&self) -> Option<(Arc<OwnedFace>, ParsedFaceSource)> {
         glyph_backend::parsed_face_with_source(self)
     }

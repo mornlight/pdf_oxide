@@ -310,6 +310,14 @@ pub use outline::{Destination, OutlineItem};
 pub use fonts::global_cache::{
     clear_global_font_cache, global_font_cache_stats, set_global_font_cache_capacity,
 };
+#[cfg(feature = "system-font-audit")]
+#[cfg_attr(docsrs, doc(cfg(feature = "system-font-audit")))]
+pub use fonts::system_font::{
+    reset_system_font_audit, system_font_audit_snapshot, SystemFontAuditEntry,
+};
+#[cfg(feature = "system-font-audit")]
+#[cfg_attr(docsrs, doc(cfg(feature = "system-font-audit")))]
+pub use fonts::system_font_cache::{cache_io_audit_snapshot, reset_cache_io_audit, CacheIoAudit};
 
 // Global CMap cache management
 pub use fonts::cmap::{clear_cmap_cache, cmap_cache_size};

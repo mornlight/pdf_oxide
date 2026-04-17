@@ -1,17 +1,80 @@
+use super::system_font_cache;
 use owned_ttf_parser::OwnedFace;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
-static SYSTEM_FONT_DB: LazyLock<fontdb::Database> = LazyLock::new(|| {
-    let mut fontdb = fontdb::Database::new();
-    fontdb.load_system_fonts();
-    fontdb
-});
+static SYSTEM_FONT_DB: LazyLock<fontdb::Database> =
+    LazyLock::new(system_font_cache::load_or_build_database);
 
 static SYSTEM_FONT_FACE_CACHE: LazyLock<Mutex<HashMap<String, Option<Arc<OwnedFace>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static SYSTEM_FONT_HOT_ANSWER_CACHE: LazyLock<
+    Mutex<HashMap<system_font_cache::SystemFontRequestSignature, system_font_cache::HotFontAnswer>>,
+> = LazyLock::new(|| Mutex::new(system_font_cache::read_hot_answer_cache()));
+static SYSTEM_FONT_AUDIT: LazyLock<Mutex<Vec<SystemFontAuditEntry>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[derive(Debug, Clone, Serialize)]
+/// One system-font fallback lookup observed during the current process.
+pub struct SystemFontAuditEntry {
+    /// The PDF font base name that requested a system fallback face.
+    pub pdf_font_name: String,
+    /// Whether the lookup resolved to a concrete system font file.
+    pub resolved: bool,
+    /// The resolved system font file path when lookup succeeded.
+    pub resolved_path: Option<String>,
+}
+
+fn push_audit_entry(entry: SystemFontAuditEntry) {
+    if let Ok(mut audit) = SYSTEM_FONT_AUDIT.lock() {
+        audit.push(entry);
+    }
+}
+
+/// Clear all recorded system-font fallback audit entries for the current process.
+pub fn reset_system_font_audit() {
+    if let Ok(mut audit) = SYSTEM_FONT_AUDIT.lock() {
+        audit.clear();
+    }
+    system_font_cache::reset_cache_io_audit();
+}
+
+/// Return a snapshot of recorded system-font fallback audit entries.
+pub fn system_font_audit_snapshot() -> Vec<SystemFontAuditEntry> {
+    SYSTEM_FONT_AUDIT
+        .lock()
+        .map(|audit| audit.clone())
+        .unwrap_or_default()
+}
 
 pub(crate) fn load_system_font_data(pdf_font_name: &str) -> Option<(Vec<u8>, u32)> {
+    let signature =
+        system_font_cache::SystemFontRequestSignature::from_pdf_font_name(pdf_font_name);
+    if let Ok(cache) = SYSTEM_FONT_HOT_ANSWER_CACHE.lock() {
+        if let Some(answer) = cache.get(&signature) {
+            if answer.is_valid() {
+                if let Ok(font_data) = std::fs::read(&answer.path) {
+                    push_audit_entry(SystemFontAuditEntry {
+                        pdf_font_name: pdf_font_name.to_string(),
+                        resolved: true,
+                        resolved_path: Some(answer.path.display().to_string()),
+                    });
+                    return Some((font_data, answer.face_index));
+                }
+            }
+        }
+    }
+    if let Ok(mut cache) = SYSTEM_FONT_HOT_ANSWER_CACHE.lock() {
+        let stale_removed = cache
+            .get(&signature)
+            .is_some_and(|answer| !answer.is_valid());
+        if stale_removed {
+            cache.remove(&signature);
+            let _ = system_font_cache::write_hot_answer_cache(&cache);
+        }
+    }
+
     let clean_name = if let Some(plus_idx) = pdf_font_name.find('+') {
         &pdf_font_name[plus_idx + 1..]
     } else {
@@ -141,12 +204,44 @@ pub(crate) fn load_system_font_data(pdf_font_name: &str) -> Option<(Vec<u8>, u32
             SYSTEM_FONT_DB.with_face_data(id, |face_data, index| {
                 data = Some((face_data.to_vec(), index));
             });
+            if let Some((font_data, index)) = data {
+                let mut resolved_path = None;
+                if let Some((fontdb::Source::File(path), face_index)) =
+                    SYSTEM_FONT_DB.face_source(id)
+                {
+                    resolved_path = Some(path.display().to_string());
+                    if let Ok(metadata) = system_font_cache::FontFileMetadata::from_path(&path) {
+                        if let Ok(mut cache) = SYSTEM_FONT_HOT_ANSWER_CACHE.lock() {
+                            cache.insert(
+                                signature.clone(),
+                                system_font_cache::HotFontAnswer {
+                                    path,
+                                    face_index,
+                                    metadata,
+                                },
+                            );
+                            let _ = system_font_cache::write_hot_answer_cache(&cache);
+                        }
+                    }
+                }
+                push_audit_entry(SystemFontAuditEntry {
+                    pdf_font_name: pdf_font_name.to_string(),
+                    resolved: true,
+                    resolved_path,
+                });
+                return Some((font_data, index));
+            }
             if data.is_some() {
                 return data;
             }
         }
     }
 
+    push_audit_entry(SystemFontAuditEntry {
+        pdf_font_name: pdf_font_name.to_string(),
+        resolved: false,
+        resolved_path: None,
+    });
     None
 }
 
