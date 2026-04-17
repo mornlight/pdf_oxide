@@ -338,12 +338,18 @@ pub struct PdfDocument {
     font_fingerprint_cache:
         Mutex<BoundedEntryCache<u64, Vec<(String, Arc<crate::fonts::FontInfo>)>>>,
     /// Name-based font set cache keyed by hash of sorted font names.
-    /// Catches pages with different font ObjectRefs but the same font name→base font
+    /// Catches pages with different font ObjectRefs but the same font name→font identity
     /// mapping (common in PDFs that create new font objects per page).
-    /// Stores the resolved font set (Arc-wrapped to avoid cloning) plus a spot-check
-    /// (font_name, content_hash) pair for verification before reuse. Bounded at 256 entries.
+    /// Stores the resolved font set (Arc-wrapped to avoid cloning) plus the full
+    /// name→identity-hash mapping for verification before reuse.
     font_name_set_cache: Mutex<
-        BoundedEntryCache<u64, (Arc<Vec<(String, Arc<crate::fonts::FontInfo>)>>, String, u64)>,
+        BoundedEntryCache<
+            u64,
+            (
+                Arc<Vec<(String, Arc<crate::fonts::FontInfo>)>>,
+                Arc<Vec<(String, u64)>>,
+            ),
+        >,
     >,
     /// Per-font identity cache keyed by font_identity_hash (BaseFont + Subtype + Encoding +
     /// ToUnicode + FontDescriptor + DescendantFonts references). Skips expensive
@@ -595,6 +601,11 @@ fn contains_objstm_marker(window: &[u8]) -> bool {
         i += 1;
     }
     false
+}
+
+struct GlobalFontCacheCandidate {
+    key: u64,
+    predecoded_tounicode: Option<Vec<u8>>,
 }
 
 impl PdfDocument {
@@ -6858,15 +6869,16 @@ impl PdfDocument {
             },
         };
 
+        // Single-pass extraction with the provided config
         if !Self::may_contain_text(&content_data) {
             return Ok(Vec::new());
         }
 
-        // Single-pass extraction with the provided config
         let mut extractor = TextExtractor::with_config(config);
         if let Some(resources) = page_dict.get("Resources") {
             extractor.set_resources(resources.clone());
             extractor.set_document(self as *const PdfDocument);
+
             if let Err(e) = self.load_fonts(resources, &mut extractor) {
                 log::warn!(
                     "Failed to load fonts for page {}: {}, continuing with defaults",
@@ -8689,6 +8701,139 @@ impl PdfDocument {
         }
     }
 
+    #[cfg(test)]
+    fn font_global_cache_key(&self, font_obj: &Object) -> Option<u64> {
+        self.font_global_cache_candidate(font_obj)
+            .map(|candidate| candidate.key)
+    }
+
+    fn font_global_cache_candidate(&self, font_obj: &Object) -> Option<GlobalFontCacheCandidate> {
+        use std::hash::{Hash, Hasher};
+
+        let dict = font_obj.as_dict()?;
+        let subtype = dict.get("Subtype").and_then(Object::as_name).unwrap_or("");
+        if !matches!(subtype, "Type1" | "TrueType" | "MMType1") {
+            return None;
+        }
+
+        if self.font_has_embedded_font_program(font_obj) {
+            return None;
+        }
+
+        let encoding_name = match dict.get("Encoding") {
+            None => None,
+            Some(Object::Name(name)) => Some(name.as_str()),
+            _ => return None,
+        };
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+        1u8.hash(&mut hasher);
+        dict.get("BaseFont")
+            .and_then(Object::as_name)
+            .unwrap_or("Unknown")
+            .hash(&mut hasher);
+
+        2u8.hash(&mut hasher);
+        subtype.hash(&mut hasher);
+
+        3u8.hash(&mut hasher);
+        encoding_name.hash(&mut hasher);
+
+        4u8.hash(&mut hasher);
+        dict.get("FirstChar")
+            .and_then(Object::as_integer)
+            .unwrap_or(-1)
+            .hash(&mut hasher);
+
+        5u8.hash(&mut hasher);
+        dict.get("LastChar")
+            .and_then(Object::as_integer)
+            .unwrap_or(-1)
+            .hash(&mut hasher);
+
+        if let Some(widths_obj) = dict.get("Widths") {
+            6u8.hash(&mut hasher);
+            let resolved = if let Some(widths_ref) = widths_obj.as_reference() {
+                self.load_object(widths_ref).ok()?
+            } else {
+                widths_obj.clone()
+            };
+            let widths = resolved.as_array()?;
+            widths.len().hash(&mut hasher);
+            for width in widths {
+                let value = width
+                    .as_real()
+                    .or_else(|| width.as_integer().map(|value| value as f64))?;
+                value.to_bits().hash(&mut hasher);
+            }
+        }
+
+        let mut predecoded_tounicode = None;
+        if let Some(to_unicode_obj) = dict.get("ToUnicode") {
+            7u8.hash(&mut hasher);
+            let stream_bytes = self.decode_font_stream_for_cache(to_unicode_obj)?;
+            stream_bytes.hash(&mut hasher);
+            predecoded_tounicode = Some(stream_bytes);
+        }
+
+        if let Some(descriptor_dict) = self.resolve_font_descriptor_dict(font_obj) {
+            8u8.hash(&mut hasher);
+            descriptor_dict
+                .get("Flags")
+                .and_then(Object::as_integer)
+                .unwrap_or(-1)
+                .hash(&mut hasher);
+            descriptor_dict
+                .get("FontWeight")
+                .and_then(Object::as_integer)
+                .unwrap_or(-1)
+                .hash(&mut hasher);
+            let stem_v = descriptor_dict
+                .get("StemV")
+                .and_then(|stem_v_obj| {
+                    stem_v_obj
+                        .as_real()
+                        .map(|value| value as f64)
+                        .or_else(|| stem_v_obj.as_integer().map(|value| value as f64))
+                })
+                .unwrap_or(f64::NAN);
+            stem_v.to_bits().hash(&mut hasher);
+        }
+
+        Some(GlobalFontCacheCandidate {
+            key: hasher.finish(),
+            predecoded_tounicode,
+        })
+    }
+
+    fn decode_font_stream_for_cache(&self, stream_obj: &Object) -> Option<Vec<u8>> {
+        if let Some(stream_ref) = stream_obj.as_reference() {
+            let resolved = self.load_object(stream_ref).ok()?;
+            self.decode_stream_with_encryption(&resolved, stream_ref)
+                .ok()
+        } else if matches!(stream_obj, Object::Stream { .. }) {
+            self.decode_stream_with_encryption(stream_obj, ObjectRef::new(0, 0))
+                .ok()
+        } else {
+            None
+        }
+    }
+
+    fn resolve_font_descriptor_dict(
+        &self,
+        font_obj: &Object,
+    ) -> Option<std::collections::HashMap<String, Object>> {
+        let dict = font_obj.as_dict()?;
+        let descriptor_obj = dict.get("FontDescriptor")?;
+        let descriptor = if let Some(descriptor_ref) = descriptor_obj.as_reference() {
+            self.load_object(descriptor_ref).ok()?
+        } else {
+            descriptor_obj.clone()
+        };
+        descriptor.as_dict().cloned()
+    }
+
     /// Compute a cheap content-based font identity hash from a loaded font object.
     /// Uses only inline fields (no reference resolution / load_object calls) to keep
     /// the cost at ~200ns. Relies on BaseFont + Subtype + Encoding (when inline) to
@@ -8744,6 +8889,55 @@ impl PdfDocument {
             }
         }
         hasher.finish()
+    }
+
+    fn dict_has_embedded_font_program(dict: &std::collections::HashMap<String, Object>) -> bool {
+        dict.contains_key("FontFile")
+            || dict.contains_key("FontFile2")
+            || dict.contains_key("FontFile3")
+    }
+
+    fn font_has_embedded_font_program(&self, font_obj: &Object) -> bool {
+        let Some(dict) = font_obj.as_dict() else {
+            return false;
+        };
+
+        if let Some(descriptor_obj) = dict.get("FontDescriptor") {
+            let descriptor = if let Some(descriptor_ref) = descriptor_obj.as_reference() {
+                self.load_object(descriptor_ref).ok()
+            } else {
+                Some(descriptor_obj.clone())
+            };
+            if descriptor
+                .as_ref()
+                .and_then(Object::as_dict)
+                .is_some_and(Self::dict_has_embedded_font_program)
+            {
+                return true;
+            }
+        }
+
+        if let Some(Object::Array(descendants)) = dict.get("DescendantFonts") {
+            for descendant in descendants {
+                let descendant_obj = if let Some(descendant_ref) = descendant.as_reference() {
+                    self.load_object(descendant_ref).ok()
+                } else {
+                    Some(descendant.clone())
+                };
+                if descendant_obj.as_ref().is_some_and(|descendant_obj| {
+                    self.font_has_embedded_font_program(descendant_obj)
+                }) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    #[cfg(test)]
+    fn font_can_use_global_cache(&self, font_obj: &Object) -> bool {
+        self.font_global_cache_key(font_obj).is_some()
     }
 
     /// Load fonts from a Resources dictionary into the extractor.
@@ -8854,19 +9048,31 @@ impl PdfDocument {
                     .lock_or_recover()
                     .get(&name_hash)
                     .cloned();
-                if let Some((cached_set, _check_name, _check_hash)) = cached_name_set {
-                    // Layer 4: Same font names within a document virtually always map
-                    // to the same underlying fonts. Trust the name-based cache to avoid
-                    // expensive load_object calls for spot-check verification.
-                    for (name, font_arc) in cached_set.iter() {
-                        extractor.add_font_shared(name.clone(), Arc::clone(font_arc));
+                if let Some((cached_set, cached_hashes)) = cached_name_set {
+                    let mapping_matches = cached_hashes.iter().all(|(font_name, expected_hash)| {
+                        font_dict
+                            .get(font_name)
+                            .and_then(|font_obj| {
+                                let resolved = if let Some(font_ref) = font_obj.as_reference() {
+                                    self.load_object(font_ref).ok()
+                                } else {
+                                    Some(font_obj.clone())
+                                }?;
+                                Some(Self::font_identity_hash_cheap(&resolved) == *expected_hash)
+                            })
+                            .unwrap_or(false)
+                    });
+
+                    if mapping_matches {
+                        for (name, font_arc) in cached_set.iter() {
+                            extractor.add_font_shared(name.clone(), Arc::clone(font_arc));
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
                 }
 
                 let mut all_from_cache = true;
-                // Track spot-check data: first font name and its content hash
-                let mut spot_check: Option<(String, u64)> = None;
+                let mut name_hash_entries = Vec::new();
 
                 // Sort font entries by name for deterministic processing order.
                 // HashMap iteration order is randomized per-process, which causes
@@ -8889,11 +9095,12 @@ impl PdfDocument {
 
                         // Compute identity hash (cheap: 3-6 dict lookups, ~200ns)
                         let id_hash = Self::font_identity_hash_cheap(&font);
+                        let global_cache_candidate = self.font_global_cache_candidate(&font);
+                        let global_cache_key = global_cache_candidate
+                            .as_ref()
+                            .map(|candidate| candidate.key);
 
-                        // Collect spot-check data (first font only) for name cache
-                        if spot_check.is_none() {
-                            spot_check = Some((name.clone(), id_hash));
-                        }
+                        name_hash_entries.push((name.clone(), id_hash));
 
                         // Layer 5: Per-font identity cache — skip from_dict when a
                         // structurally identical font was already parsed elsewhere.
@@ -8912,27 +9119,36 @@ impl PdfDocument {
 
                         // Layer 6: Global cross-document font cache — reuse fonts
                         // parsed by previous PdfDocument instances in this process.
-                        if let Some(cached) =
-                            crate::fonts::global_cache::global_font_cache_get(id_hash)
-                        {
-                            self.font_identity_cache
-                                .lock_or_recover()
-                                .insert(id_hash, Arc::clone(&cached));
-                            self.font_cache
-                                .lock_or_recover()
-                                .insert(font_ref, Arc::clone(&cached));
-                            extractor.add_font_shared(name.clone(), cached);
-                            continue;
+                        if let Some(global_cache_key) = global_cache_key {
+                            if let Some(cached) =
+                                crate::fonts::global_cache::global_font_cache_get(global_cache_key)
+                            {
+                                self.font_identity_cache
+                                    .lock_or_recover()
+                                    .insert(id_hash, Arc::clone(&cached));
+                                self.font_cache
+                                    .lock_or_recover()
+                                    .insert(font_ref, Arc::clone(&cached));
+                                extractor.add_font_shared(name.clone(), cached);
+                                continue;
+                            }
                         }
 
-                        match FontInfo::from_dict(&font, self) {
+                        match FontInfo::from_dict_with_predecoded_tounicode(
+                            &font,
+                            self,
+                            global_cache_candidate
+                                .and_then(|candidate| candidate.predecoded_tounicode),
+                        ) {
                             Ok(font_info) => {
                                 let arc = Arc::new(font_info);
                                 // Populate both document-level and global caches
-                                crate::fonts::global_cache::global_font_cache_insert(
-                                    id_hash,
-                                    Arc::clone(&arc),
-                                );
+                                if let Some(global_cache_key) = global_cache_key {
+                                    crate::fonts::global_cache::global_font_cache_insert(
+                                        global_cache_key,
+                                        Arc::clone(&arc),
+                                    );
+                                }
                                 self.font_identity_cache
                                     .lock_or_recover()
                                     .insert(id_hash, Arc::clone(&arc));
@@ -8954,6 +9170,8 @@ impl PdfDocument {
                         // Direct font object — parse without caching (no stable key)
                         all_from_cache = false;
                         let font = font_obj.clone();
+                        let id_hash = Self::font_identity_hash_cheap(&font);
+                        name_hash_entries.push((name.clone(), id_hash));
                         match FontInfo::from_dict(&font, self) {
                             Ok(font_info) => {
                                 extractor.add_font(name.clone(), font_info);
@@ -8987,11 +9205,12 @@ impl PdfDocument {
                     .lock_or_recover()
                     .insert(fingerprint, font_set.clone());
 
-                // Cache by font names with spot-check data for Layer 4
-                if let Some((check_name, check_hash)) = spot_check {
+                // Cache by font names with full name→identity-hash mapping for Layer 4.
+                if !name_hash_entries.is_empty() {
+                    name_hash_entries.sort_by(|a, b| a.0.cmp(&b.0));
                     self.font_name_set_cache
                         .lock_or_recover()
-                        .insert(name_hash, (Arc::new(font_set), check_name, check_hash));
+                        .insert(name_hash, (Arc::new(font_set), Arc::new(name_hash_entries)));
                 }
 
                 return Ok(());
@@ -11356,6 +11575,108 @@ mod tests {
         pdf
     }
 
+    fn build_pdf_with_extra_objects(
+        content: &[u8],
+        extra_objects: Vec<(usize, Vec<u8>)>,
+    ) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets: Vec<Option<usize>> = vec![None; 5];
+
+        offsets[1] = Some(pdf.len());
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        offsets[2] = Some(pdf.len());
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offsets[3] = Some(pdf.len());
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> >>\nendobj\n",
+        );
+
+        offsets[4] = Some(pdf.len());
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let mut extra_objects = extra_objects;
+        extra_objects.sort_by_key(|(obj_num, _)| *obj_num);
+        let max_obj = extra_objects
+            .iter()
+            .map(|(obj_num, _)| *obj_num)
+            .max()
+            .unwrap_or(4)
+            .max(4);
+        if offsets.len() <= max_obj {
+            offsets.resize(max_obj + 1, None);
+        }
+
+        for (obj_num, body) in extra_objects {
+            offsets[obj_num] = Some(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", obj_num).as_bytes());
+            pdf.extend_from_slice(&body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+
+        let xref_off = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", max_obj + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for off in offsets.iter().skip(1).take(max_obj) {
+            if let Some(offset) = off {
+                pdf.extend_from_slice(format!("{:010} 00000 n \n", offset).as_bytes());
+            } else {
+                pdf.extend_from_slice(b"0000000000 65535 f \n");
+            }
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+                max_obj + 1,
+                xref_off
+            )
+            .as_bytes(),
+        );
+
+        pdf
+    }
+
+    fn build_minimal_pdf_with_page_resources(content: &[u8], resources_body: &[u8]) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+
+        let off1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len();
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources ");
+        pdf.extend_from_slice(resources_body);
+        pdf.extend_from_slice(b" >>\nendobj\n");
+
+        let off4 = pdf.len();
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_off = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 5\n");
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off1).as_bytes());
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off2).as_bytes());
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off3).as_bytes());
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off4).as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off)
+                .as_bytes(),
+        );
+
+        pdf
+    }
+
     /// Build a minimal PDF with a multi-page structure (given page count).
     fn build_multi_page_pdf(page_count: usize) -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
@@ -11755,6 +12076,27 @@ mod tests {
         let mut doc = PdfDocument::from_bytes(pdf).unwrap();
         let chars = doc.extract_chars(0).unwrap();
         assert!(chars.is_empty());
+    }
+
+    #[test]
+    fn test_extract_chars_skips_pages_without_text_capable_resources() {
+        let content = b"BT /F1 12 Tf 72 700 Td (Hello) Tj ET";
+        let resources = b"<< /XObject << /Im1 << /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >> >> >>";
+        let pdf = build_minimal_pdf_with_page_resources(content, resources);
+        let mut doc = PdfDocument::from_bytes(pdf).unwrap();
+
+        let page = doc.get_page(0).unwrap();
+        let page_dict = page.as_dict().unwrap();
+        assert!(
+            doc.page_cannot_have_text(page_dict),
+            "image-only resources should let extract_chars() fast-skip the page"
+        );
+
+        let chars = doc.extract_chars(0).unwrap();
+        assert!(
+            chars.is_empty(),
+            "extract_chars() should honor page_cannot_have_text() and skip pages without font resources"
+        );
     }
 
     // ========================================================================
@@ -13744,6 +14086,127 @@ mod tests {
         assert_ne!(PdfDocument::font_identity_hash_cheap(&Object::Dictionary(d)), 0);
     }
 
+    #[test]
+    fn test_dict_has_embedded_font_program_detects_fontfile2() {
+        let mut descriptor = std::collections::HashMap::new();
+        descriptor.insert("FontFile2".to_string(), Object::Reference(ObjectRef::new(10, 0)));
+
+        assert!(PdfDocument::dict_has_embedded_font_program(&descriptor));
+    }
+
+    #[test]
+    fn test_dict_has_embedded_font_program_ignores_plain_descriptor() {
+        let mut descriptor = std::collections::HashMap::new();
+        descriptor.insert("Type".to_string(), Object::Name("FontDescriptor".to_string()));
+
+        assert!(!PdfDocument::dict_has_embedded_font_program(&descriptor));
+    }
+
+    #[test]
+    fn test_font_has_embedded_font_program_detects_descendant_descriptor() {
+        let pdf = build_minimal_pdf(b"");
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+
+        let mut descriptor = std::collections::HashMap::new();
+        descriptor.insert("FontFile3".to_string(), Object::Reference(ObjectRef::new(11, 0)));
+
+        let mut descendant = std::collections::HashMap::new();
+        descendant.insert("FontDescriptor".to_string(), Object::Dictionary(descriptor));
+
+        let mut font = std::collections::HashMap::new();
+        font.insert(
+            "DescendantFonts".to_string(),
+            Object::Array(vec![Object::Dictionary(descendant)]),
+        );
+
+        assert!(doc.font_has_embedded_font_program(&Object::Dictionary(font)));
+    }
+
+    #[test]
+    fn test_font_can_use_global_cache_for_plain_builtin_font() {
+        let pdf = build_minimal_pdf(b"");
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+
+        let mut font = std::collections::HashMap::new();
+        font.insert("BaseFont".to_string(), Object::Name("Helvetica".to_string()));
+        font.insert("Subtype".to_string(), Object::Name("Type1".to_string()));
+        font.insert("Encoding".to_string(), Object::Name("WinAnsiEncoding".to_string()));
+
+        assert!(doc.font_can_use_global_cache(&Object::Dictionary(font)));
+    }
+
+    #[test]
+    fn test_font_can_use_global_cache_allows_widths_based_simple_font() {
+        let pdf = build_minimal_pdf(b"");
+        let doc = PdfDocument::from_bytes(pdf).unwrap();
+
+        let mut font = std::collections::HashMap::new();
+        font.insert("BaseFont".to_string(), Object::Name("TimesNewRomanPSMT".to_string()));
+        font.insert("Subtype".to_string(), Object::Name("TrueType".to_string()));
+        font.insert("Encoding".to_string(), Object::Name("WinAnsiEncoding".to_string()));
+        font.insert(
+            "Widths".to_string(),
+            Object::Array(vec![Object::Integer(500), Object::Integer(600)]),
+        );
+        font.insert("FirstChar".to_string(), Object::Integer(32));
+        font.insert("LastChar".to_string(), Object::Integer(33));
+
+        assert!(doc.font_can_use_global_cache(&Object::Dictionary(font)));
+    }
+
+    #[test]
+    fn test_font_global_cache_key_changes_with_decoded_tounicode_bytes() {
+        let cmap_a = b"/CIDInit /ProcSet findresource begin\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n1 beginbfchar\n<41> <0041>\nendbfchar\nend\n";
+        let cmap_b = b"/CIDInit /ProcSet findresource begin\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n1 beginbfchar\n<41> <0058>\nendbfchar\nend\n";
+        let pdf_a = build_pdf_with_extra_objects(
+            b"",
+            vec![(
+                10,
+                format!(
+                    "<< /Length {} >>\nstream\n{}\nendstream",
+                    cmap_a.len(),
+                    String::from_utf8_lossy(cmap_a)
+                )
+                .into_bytes(),
+            )],
+        );
+        let pdf_b = build_pdf_with_extra_objects(
+            b"",
+            vec![(
+                10,
+                format!(
+                    "<< /Length {} >>\nstream\n{}\nendstream",
+                    cmap_b.len(),
+                    String::from_utf8_lossy(cmap_b)
+                )
+                .into_bytes(),
+            )],
+        );
+        let doc_a = PdfDocument::from_bytes(pdf_a).unwrap();
+        let doc_b = PdfDocument::from_bytes(pdf_b).unwrap();
+
+        let mut font = std::collections::HashMap::new();
+        font.insert("BaseFont".to_string(), Object::Name("ArialMT".to_string()));
+        font.insert("Subtype".to_string(), Object::Name("TrueType".to_string()));
+        font.insert("Encoding".to_string(), Object::Name("WinAnsiEncoding".to_string()));
+        font.insert(
+            "Widths".to_string(),
+            Object::Array(vec![Object::Integer(500), Object::Integer(600)]),
+        );
+        font.insert("FirstChar".to_string(), Object::Integer(32));
+        font.insert("LastChar".to_string(), Object::Integer(33));
+        font.insert("ToUnicode".to_string(), Object::Reference(ObjectRef::new(10, 0)));
+
+        let key_a = doc_a
+            .font_global_cache_key(&Object::Dictionary(font.clone()))
+            .expect("font should be globally cacheable");
+        let key_b = doc_b
+            .font_global_cache_key(&Object::Dictionary(font))
+            .expect("font should be globally cacheable");
+
+        assert_ne!(key_a, key_b);
+    }
+
     // ========================================================================
     // NEW COVERAGE TESTS — Batch 10: Annotation helper and tests
     // ========================================================================
@@ -14704,15 +15167,42 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_page_text_chars_derived_from_spans() {
-        let content = b"BT /F1 12 Tf (Hello) Tj ET";
-        let pdf = build_minimal_pdf(content);
-        let mut doc = PdfDocument::from_bytes(pdf).unwrap();
+    fn test_extract_page_text_chars_still_come_from_spans() {
+        let bytes = crate::api::Pdf::from_text("Ag").unwrap().into_bytes();
+        let mut doc = PdfDocument::from_bytes(bytes).unwrap();
+
         let page_text = doc.extract_page_text(0).unwrap();
-        // Total chars should equal sum of chars across all spans
-        let expected_char_count: usize =
-            page_text.spans.iter().map(|s| s.text.chars().count()).sum();
-        assert_eq!(page_text.chars.len(), expected_char_count);
+        let expected_chars: Vec<_> = page_text
+            .spans
+            .iter()
+            .flat_map(|span| span.to_chars())
+            .collect();
+
+        assert_eq!(page_text.chars.len(), expected_chars.len());
+        for (actual, expected) in page_text.chars.iter().zip(expected_chars.iter()) {
+            assert_eq!(actual.char, expected.char);
+            assert_eq!(actual.bbox, expected.bbox);
+            assert_eq!(actual.font_name, expected.font_name);
+            assert_eq!(actual.font_size, expected.font_size);
+        }
+    }
+
+    #[test]
+    fn test_extract_page_text_chars_use_span_derived_boxes() {
+        let bytes = crate::api::Pdf::from_text("Ag").unwrap().into_bytes();
+        let mut doc = PdfDocument::from_bytes(bytes).unwrap();
+
+        let page_text = doc.extract_page_text(0).unwrap();
+        let expected_chars: Vec<_> = page_text
+            .spans
+            .iter()
+            .flat_map(|span| span.to_chars())
+            .collect();
+
+        assert_eq!(page_text.chars.len(), 2);
+        assert_eq!(page_text.chars.len(), expected_chars.len());
+        assert_eq!(page_text.chars[0].bbox, expected_chars[0].bbox);
+        assert_eq!(page_text.chars[1].bbox, expected_chars[1].bbox);
     }
 
     #[test]

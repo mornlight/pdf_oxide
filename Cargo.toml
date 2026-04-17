@@ -87,6 +87,8 @@ brotli = "8"  # Brotli compression (PDF 2.0, ISO 32000-2:2020)
 
 # Font parsing
 ttf-parser = "0.25"  # TrueType font parser for embedded font cmap tables
+owned_ttf_parser = "0.25.1"
+freetype-rs = { version = "0.38", optional = true }
 phf = { version = "0.13", features = ["macros"] }  # Perfect hash maps for Adobe Glyph List
 encoding_rs = "0.8"  # Shift-JIS, EUC-JP, and other CJK encodings for predefined CMaps
 
@@ -160,7 +162,7 @@ pdfium-render = { version = "0.9", optional = true }
 
 # Rendering (optional - for page to image conversion)
 tiny-skia = { version = "0.12", optional = true }
-fontdb = { version = "0.23", optional = true }
+fontdb = "0.23"
 rustybuzz = { version = "0.20", optional = true }
 
 lzw = "0.10.0"
@@ -203,8 +205,10 @@ wasm-ml = ["wasm", "ml"]
 # Debug feature for span merging analysis
 debug-span-merging = []
 
+# Expose text extraction debug/profiling APIs.
+
 # Page rendering to images (pure Rust via tiny-skia)
-rendering = ["dep:tiny-skia", "dep:fontdb", "dep:rustybuzz"]
+rendering = ["dep:tiny-skia", "dep:rustybuzz"]
 
 # Digital signatures (create and verify PDF signatures)
 signatures = ["dep:x509-parser", "dep:cms", "dep:rsa", "dep:der", "dep:spki", "dep:pkcs1", "dep:pkcs8", "dep:signature", "dep:sha1"]
@@ -217,6 +221,10 @@ office = ["dep:calamine", "dep:zip"]
 
 # Parallel page extraction via rayon
 parallel = ["dep:rayon"]
+
+# Optional FreeType backend for embedded raw Type1 glyph bounding boxes.
+type1-freetype = ["dep:freetype-rs"]
+type1-freetype-bundled = ["type1-freetype", "freetype-rs/bundled"]
 
 [profile.release]
 opt-level = 3
