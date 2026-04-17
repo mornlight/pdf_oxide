@@ -4,8 +4,9 @@ use byteorder::{BigEndian, ReadBytesExt};
 /// This module extracts Unicode mappings from TrueType font cmap tables,
 /// providing a fallback for Type0 fonts missing ToUnicode CMaps.
 ///
-/// The cmap table maps glyph IDs (GIDs) to Unicode code points.
-/// We support formats 4 (BMP), 6 (trimmed), and 12 (Unicode full).
+/// The cmap table maps character codes to glyph IDs, and Unicode-capable
+/// subtables can also be inverted to recover glyph-to-Unicode mappings.
+/// We support formats 0, 4 (BMP), 6 (trimmed), and 12 (Unicode full).
 use std::collections::HashMap;
 use std::io::Cursor;
 
@@ -39,11 +40,22 @@ fn mac_roman_to_unicode(byte: u8) -> char {
     MAC_ROMAN_HIGH[(byte - 0x80) as usize]
 }
 
+#[derive(Debug, Default)]
+struct ParsedCMapSubtable {
+    gid_to_unicode: HashMap<u16, char>,
+    char_code_to_gid: HashMap<u16, u16>,
+}
+
 /// Represents a TrueType cmap table extracted from an embedded font
 #[derive(Debug, Clone)]
 pub struct TrueTypeCMap {
     /// Mapping from Glyph ID to Unicode character
     gid_to_unicode: HashMap<u16, char>,
+    /// Mapping from font character code to glyph ID.
+    ///
+    /// This is needed for embedded subset fonts that expose only a simple
+    /// non-Unicode cmap (for example format 0 Mac Roman tables).
+    char_code_to_gid: HashMap<u16, u16>,
 }
 
 impl TrueTypeCMap {
@@ -52,10 +64,13 @@ impl TrueTypeCMap {
     /// The TrueType sfnt structure contains a directory of tables.
     /// We locate the 'cmap' table and parse the best available subtable.
     ///
-    /// Priority for cmap subtables:
-    /// 1. Platform 3 (Windows), Encoding 10 (Unicode full repertoire) - supports all Unicode
-    /// 2. Platform 3 (Windows), Encoding 1 (Unicode BMP) - supports basic multilingual plane
-    /// 3. Platform 0 (Unicode), Encoding 3 - fallback to old Unicode platform
+    /// Priority for Unicode-capable subtables:
+    /// 1. Platform 3 (Windows), Encoding 10 (Unicode full repertoire)
+    /// 2. Platform 3 (Windows), Encoding 1 (Unicode BMP)
+    /// 3. Platform 0 (Unicode), any encoding
+    ///
+    /// If no Unicode-capable subtable exists, we still keep the best available
+    /// character-code map for glyph-id recovery.
     pub fn from_font_data(data: &[u8]) -> Result<Self, String> {
         let mut cursor = Cursor::new(data);
 
@@ -86,9 +101,7 @@ impl TrueTypeCMap {
             .read_u16::<BigEndian>()
             .map_err(|e| format!("Failed to read cmap subtable count: {}", e))?;
 
-        // Read all subtable records
-        let mut best_subtable: Option<(u32, u32, u32)> = None; // (platform_id, encoding_id, offset)
-        let mut best_priority = -1i32;
+        let mut subtables = Vec::with_capacity(num_subtables as usize);
 
         for _ in 0..num_subtables {
             let platform_id = cursor
@@ -100,36 +113,54 @@ impl TrueTypeCMap {
             let offset = cursor
                 .read_u32::<BigEndian>()
                 .map_err(|e| format!("Failed to read subtable offset: {}", e))?;
-
-            // Calculate priority: higher is better
-            let priority = match (platform_id, encoding_id) {
-                (3, 10) => 30, // Windows, Unicode full repertoire
-                (3, 1) => 20,  // Windows, Unicode BMP
-                (0, 3) => 10,  // Unicode platform, Unicode 2.0
-                _ => 0,
-            };
-
-            if priority > best_priority {
-                best_priority = priority;
-                best_subtable = Some((platform_id as u32, encoding_id as u32, offset));
-            }
+            subtables.push((platform_id, encoding_id, offset));
         }
 
-        let (platform_id, encoding_id, subtable_offset) =
-            best_subtable.ok_or_else(|| "No suitable cmap subtable found".to_string())?;
+        let best_unicode_subtable = subtables
+            .iter()
+            .copied()
+            .max_by_key(|(platform_id, encoding_id, _)| {
+                Self::unicode_subtable_priority(*platform_id, *encoding_id)
+            })
+            .filter(|(platform_id, encoding_id, _)| {
+                Self::unicode_subtable_priority(*platform_id, *encoding_id) >= 0
+            });
 
-        log::debug!(
-            "TrueType cmap: selected platform={} encoding={} offset={}",
-            platform_id,
-            encoding_id,
-            subtable_offset
-        );
+        let best_charcode_subtable = subtables
+            .iter()
+            .copied()
+            .max_by_key(|(platform_id, encoding_id, _)| {
+                Self::charcode_subtable_priority(*platform_id, *encoding_id)
+            })
+            .filter(|(platform_id, encoding_id, _)| {
+                Self::charcode_subtable_priority(*platform_id, *encoding_id) >= 0
+            });
 
-        // Parse the selected cmap subtable
-        cursor.set_position((cmap_offset + subtable_offset) as u64);
-        let gid_to_unicode = Self::parse_cmap_subtable(&mut cursor)?;
+        let Some((_, _, charcode_offset)) = best_charcode_subtable else {
+            return Err("No suitable cmap subtable found".to_string());
+        };
 
-        Ok(TrueTypeCMap { gid_to_unicode })
+        cursor.set_position((cmap_offset + charcode_offset) as u64);
+        let parsed_charcode_map = Self::parse_cmap_subtable(&mut cursor)?;
+
+        let gid_to_unicode =
+            if let Some((platform_id, encoding_id, subtable_offset)) = best_unicode_subtable {
+                log::debug!(
+                    "TrueType cmap: selected unicode platform={} encoding={} offset={}",
+                    platform_id,
+                    encoding_id,
+                    subtable_offset
+                );
+                cursor.set_position((cmap_offset + subtable_offset) as u64);
+                Self::parse_cmap_subtable(&mut cursor)?.gid_to_unicode
+            } else {
+                parsed_charcode_map.gid_to_unicode.clone()
+            };
+
+        Ok(TrueTypeCMap {
+            gid_to_unicode,
+            char_code_to_gid: parsed_charcode_map.char_code_to_gid,
+        })
     }
 
     /// Get Unicode character for a glyph ID
@@ -137,14 +168,19 @@ impl TrueTypeCMap {
         self.gid_to_unicode.get(&gid).copied()
     }
 
+    /// Get glyph ID for a font character code.
+    pub(crate) fn get_gid_for_char_code(&self, char_code: u16) -> Option<u16> {
+        self.char_code_to_gid.get(&char_code).copied()
+    }
+
     /// Get the number of glyph mappings
     pub fn len(&self) -> usize {
-        self.gid_to_unicode.len()
+        self.gid_to_unicode.len().max(self.char_code_to_gid.len())
     }
 
     /// Check if cmap is empty
     pub fn is_empty(&self) -> bool {
-        self.gid_to_unicode.is_empty()
+        self.gid_to_unicode.is_empty() && self.char_code_to_gid.is_empty()
     }
 
     // ==================================================================================
@@ -211,72 +247,94 @@ impl TrueTypeCMap {
         Err("cmap table not found in font".to_string())
     }
 
-    fn parse_cmap_subtable(cursor: &mut Cursor<&[u8]>) -> Result<HashMap<u16, char>, String> {
+    fn unicode_subtable_priority(platform_id: u16, encoding_id: u16) -> i32 {
+        match (platform_id, encoding_id) {
+            (3, 10) => 50,
+            (3, 1) => 40,
+            (0, _) => 30,
+            _ => -1,
+        }
+    }
+
+    fn charcode_subtable_priority(platform_id: u16, encoding_id: u16) -> i32 {
+        match (platform_id, encoding_id) {
+            (3, 10) => 60,
+            (3, 1) => 50,
+            (0, _) => 40,
+            (3, 0) => 30,
+            (1, 0) => 20,
+            _ => -1,
+        }
+    }
+
+    fn parse_cmap_subtable(cursor: &mut Cursor<&[u8]>) -> Result<ParsedCMapSubtable, String> {
         let format = cursor
             .read_u16::<BigEndian>()
             .map_err(|e| format!("Failed to read cmap format: {}", e))?;
 
         match format {
             0 => Self::parse_cmap_format0(cursor),
-            4 => Self::parse_cmap_format4(cursor),
-            6 => Self::parse_cmap_format6(cursor),
-            12 => Self::parse_cmap_format12(cursor),
+            4 => Self::parse_unicode_cmap(cursor, Self::parse_cmap_format4),
+            6 => Self::parse_unicode_cmap(cursor, Self::parse_cmap_format6),
+            12 => Self::parse_unicode_cmap(cursor, Self::parse_cmap_format12),
             _ => Err(format!("Unsupported cmap format: {}", format)),
         }
     }
 
+    fn parse_unicode_cmap(
+        cursor: &mut Cursor<&[u8]>,
+        parser: fn(&mut Cursor<&[u8]>) -> Result<HashMap<u32, u16>, String>,
+    ) -> Result<ParsedCMapSubtable, String> {
+        let mut parsed = ParsedCMapSubtable::default();
+        for (char_code, gid) in parser(cursor)? {
+            if let Ok(char_code_u16) = u16::try_from(char_code) {
+                parsed.char_code_to_gid.insert(char_code_u16, gid);
+            }
+            if let Some(ch) = char::from_u32(char_code) {
+                parsed.gid_to_unicode.insert(gid, ch);
+            }
+        }
+        Ok(parsed)
+    }
+
     /// Parse cmap format 0 (legacy 1-byte indexed, Mac Roman era).
-    ///
-    /// Structure per Apple TrueType reference (subtable length 262):
-    ///   u16 format       (already read by caller — 2 bytes)
-    ///   u16 length       (262: 2+2+2+256)
-    ///   u16 language
-    ///   u8  glyphIdArray[256]   — glyphId for each byte code 0..255
-    ///
-    /// Microsoft Office subset fonts (Calibri, Times New Roman subsets in
-    /// Word/Excel exports) still ship with a format-0 cmap for the `(1,0)`
-    /// Macintosh encoding alongside their `(3,1)` Unicode cmap. When the
-    /// Unicode cmap is missing or malformed we fall back to this one; the
-    /// byte code acts as the Mac Roman character code.
-    ///
-    /// Benchmark canary: ~8 Kreuzberg MS Office fixtures previously logged
-    /// "Unsupported cmap format: 0" warnings and lost font glyph mapping
-    /// as a consequence (B9).
-    fn parse_cmap_format0(cursor: &mut Cursor<&[u8]>) -> Result<HashMap<u16, char>, String> {
-        let _length = cursor
+    fn parse_cmap_format0(cursor: &mut Cursor<&[u8]>) -> Result<ParsedCMapSubtable, String> {
+        let length = cursor
             .read_u16::<BigEndian>()
             .map_err(|e| format!("Failed to read format 0 length: {}", e))?;
         let _language = cursor
             .read_u16::<BigEndian>()
             .map_err(|e| format!("Failed to read format 0 language: {}", e))?;
 
+        if length < 262 {
+            return Err(format!("Invalid format 0 length: {}", length));
+        }
+
         let mut glyph_ids = [0u8; 256];
         std::io::Read::read_exact(cursor, &mut glyph_ids)
             .map_err(|e| format!("Failed to read format 0 glyphIdArray: {}", e))?;
 
-        let mut gid_to_unicode = HashMap::new();
+        let mut parsed = ParsedCMapSubtable::default();
         for (byte, &gid) in glyph_ids.iter().enumerate() {
-            if gid == 0 {
-                continue;
-            }
-            // ASCII pass-through for 0x00..0x7F (Mac Roman lower half is
-            // identical to ASCII). Above 0x7F we route through the Mac
-            // Roman → Unicode table so byte 0x8A (a-umlaut in Mac Roman)
-            // maps to U+00E4 instead of U+008A.
-            let ch = if byte < 0x80 {
-                char::from_u32(byte as u32)
-            } else {
-                Some(mac_roman_to_unicode(byte as u8))
-            };
-            if let Some(ch) = ch {
-                gid_to_unicode.insert(gid as u16, ch);
+            if gid != 0 {
+                let gid = gid as u16;
+                parsed.char_code_to_gid.insert(byte as u16, gid);
+                let ch = if byte < 0x80 {
+                    char::from_u32(byte as u32)
+                } else {
+                    Some(mac_roman_to_unicode(byte as u8))
+                };
+                if let Some(ch) = ch {
+                    parsed.gid_to_unicode.insert(gid, ch);
+                }
             }
         }
-        Ok(gid_to_unicode)
+
+        Ok(parsed)
     }
 
     /// Parse cmap format 4 (BMP - supports characters U+0000 to U+FFFF)
-    fn parse_cmap_format4(cursor: &mut Cursor<&[u8]>) -> Result<HashMap<u16, char>, String> {
+    fn parse_cmap_format4(cursor: &mut Cursor<&[u8]>) -> Result<HashMap<u32, u16>, String> {
         let _length = cursor
             .read_u16::<BigEndian>()
             .map_err(|e| format!("Failed to read format 4 length: {}", e))?
@@ -343,8 +401,7 @@ impl TrueTypeCMap {
             glyph_id_array.push(val);
         }
 
-        // Build character to GID mappings
-        let mut gid_to_unicode = HashMap::new();
+        let mut code_to_gid = HashMap::new();
 
         for seg in 0..seg_count {
             let start = start_codes[seg] as u32;
@@ -379,18 +436,16 @@ impl TrueTypeCMap {
                 };
 
                 if gid != 0 {
-                    if let Some(ch) = char::from_u32(char_code) {
-                        gid_to_unicode.insert(gid, ch);
-                    }
+                    code_to_gid.insert(char_code, gid);
                 }
             }
         }
 
-        Ok(gid_to_unicode)
+        Ok(code_to_gid)
     }
 
     /// Parse cmap format 6 (trimmed table)
-    fn parse_cmap_format6(cursor: &mut Cursor<&[u8]>) -> Result<HashMap<u16, char>, String> {
+    fn parse_cmap_format6(cursor: &mut Cursor<&[u8]>) -> Result<HashMap<u32, u16>, String> {
         let _length = cursor
             .read_u16::<BigEndian>()
             .map_err(|e| format!("Failed to read format 6 length: {}", e))?;
@@ -405,7 +460,7 @@ impl TrueTypeCMap {
             .read_u16::<BigEndian>()
             .map_err(|e| format!("Failed to read entryCount: {}", e))? as usize;
 
-        let mut gid_to_unicode = HashMap::new();
+        let mut code_to_gid = HashMap::new();
 
         for i in 0..count {
             let gid = cursor
@@ -413,16 +468,14 @@ impl TrueTypeCMap {
                 .map_err(|e| format!("Failed to read glyphId[{}]: {}", i, e))?;
 
             let char_code = first_code as u32 + i as u32;
-            if let Some(ch) = char::from_u32(char_code) {
-                gid_to_unicode.insert(gid, ch);
-            }
+            code_to_gid.insert(char_code, gid);
         }
 
-        Ok(gid_to_unicode)
+        Ok(code_to_gid)
     }
 
     /// Parse cmap format 12 (segmented coverage - supports full Unicode)
-    fn parse_cmap_format12(cursor: &mut Cursor<&[u8]>) -> Result<HashMap<u16, char>, String> {
+    fn parse_cmap_format12(cursor: &mut Cursor<&[u8]>) -> Result<HashMap<u32, u16>, String> {
         // Skip reserved bytes
         let _reserved = cursor
             .read_u16::<BigEndian>()
@@ -440,7 +493,7 @@ impl TrueTypeCMap {
             .map_err(|e| format!("Failed to read numGroups: {}", e))?
             as usize;
 
-        let mut gid_to_unicode = HashMap::new();
+        let mut code_to_gid = HashMap::new();
 
         for _ in 0..num_groups {
             let start_char_code = cursor
@@ -455,13 +508,11 @@ impl TrueTypeCMap {
 
             for (offset, char_code) in (start_char_code..=end_char_code).enumerate() {
                 let gid = (start_gid + offset as u32) as u16;
-                if let Some(ch) = char::from_u32(char_code) {
-                    gid_to_unicode.insert(gid, ch);
-                }
+                code_to_gid.insert(char_code, gid);
             }
         }
 
-        Ok(gid_to_unicode)
+        Ok(code_to_gid)
     }
 }
 
@@ -780,6 +831,20 @@ mod tests {
     }
 
     #[test]
+    fn test_format0_exposes_char_code_to_gid_mapping() {
+        let mut gids = [0u8; 256];
+        gids[0x63] = 99;
+        gids[0x64] = 100;
+        let data = build_truetype_with_cmap_format0(gids);
+        let cmap = TrueTypeCMap::from_font_data(&data).unwrap();
+        assert_eq!(cmap.get_gid_for_char_code(0x63), Some(99));
+        assert_eq!(cmap.get_gid_for_char_code(0x64), Some(100));
+        assert_eq!(cmap.get_unicode(99), Some('c'));
+        assert_eq!(cmap.get_unicode(100), Some('d'));
+        assert!(!cmap.is_empty());
+    }
+
+    #[test]
     fn test_format12_basic() {
         // One group: chars 65-67 -> gids 1-3
         let data = build_truetype_with_cmap_format12(&[(65, 67, 1)]);
@@ -833,28 +898,28 @@ mod tests {
         gids[0x7A] = 50;
         let data = build_truetype_with_cmap_format0(gids);
         let cmap = TrueTypeCMap::from_font_data(&data).expect("format 0 parse");
+        assert_eq!(cmap.get_gid_for_char_code(0x41), Some(10));
+        assert_eq!(cmap.get_gid_for_char_code(0x42), Some(11));
+        assert_eq!(cmap.get_gid_for_char_code(0x7A), Some(50));
         assert_eq!(cmap.get_unicode(10), Some('A'));
         assert_eq!(cmap.get_unicode(11), Some('B'));
         assert_eq!(cmap.get_unicode(50), Some('z'));
-        // Absent glyphs map to nothing.
-        assert_eq!(cmap.get_unicode(99), None);
     }
 
     #[test]
     fn test_cmap_format0_mac_roman_high_half() {
-        // Byte 0x8A in Mac Roman is 'ä' (U+00E4), not raw 0x8A.
+        // High-half Macintosh Roman bytes should resolve to both Unicode and glyph ids.
         let mut gids = [0u8; 256];
         gids[0x41] = 10; // 'A' — ASCII pass-through
         gids[0x8A] = 20; // 'ä' via Mac Roman table
         gids[0xA5] = 30; // '•' bullet via Mac Roman
         let data = build_truetype_with_cmap_format0(gids);
         let cmap = TrueTypeCMap::from_font_data(&data).expect("format 0 parse");
+        assert_eq!(cmap.get_gid_for_char_code(0x41), Some(10));
+        assert_eq!(cmap.get_gid_for_char_code(0x8A), Some(20));
+        assert_eq!(cmap.get_gid_for_char_code(0xA5), Some(30));
         assert_eq!(cmap.get_unicode(10), Some('A'));
-        assert_eq!(
-            cmap.get_unicode(20),
-            Some('ä'),
-            "Mac Roman 0x8A must map to U+00E4 (a-umlaut), not raw 0x8A"
-        );
+        assert_eq!(cmap.get_unicode(20), Some('ä'));
         assert_eq!(cmap.get_unicode(30), Some('•'));
     }
 

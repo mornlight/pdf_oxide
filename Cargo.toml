@@ -147,6 +147,8 @@ brotli = "8"                                                                   #
 
 # Font parsing
 ttf-parser = "0.25" # TrueType font parser for embedded font cmap tables
+owned_ttf_parser = "0.25.1"
+freetype-rs = { version = "0.38", optional = true }
 subsetter = "0.2"   # Binary TrueType/OpenType subsetting (Typst's; MIT/Apache). Used by writer-side
 # EmbeddedFont to shrink embedded fonts to only the glyphs actually used.
 taffy = { version = "0.10", default-features = false, features = [
@@ -265,7 +267,7 @@ pdfium-render = { version = "0.9", optional = true }
 tiny-skia = { version = "0.12", optional = true }
 fast_image_resize = { version = "6", optional = true }                       # SIMD-accelerated image downscaling
 hayro-jbig2 = { version = "0.3", optional = true, default-features = false } # Pure-Rust JBIG2 decoder (Apache-2.0 OR MIT)
-fontdb = { version = "0.23", optional = true }
+fontdb = "0.23"
 rustybuzz = { version = "0.20", optional = true }
 
 uuid = { version = "1.23", features = ["v4", "js"] }
@@ -370,11 +372,11 @@ debug-span-merging = []
 # Page rendering to images (pure Rust via tiny-skia)
 rendering = ["dep:tiny-skia", "dep:fast_image_resize", "system-fonts", "dep:hayro-jbig2"]
 
-# System font discovery (fontdb) + shaping (rustybuzz). v0.3.35 splits
-# this out of `rendering` so HTML+CSS→PDF can pick it up without pulling
-# in tiny-skia. Default-on for native bindings; off for WASM (no
-# filesystem) and off for the bare Rust crate so library embedders opt in.
-system-fonts = ["dep:fontdb", "dep:rustybuzz"]
+# System font discovery/shaping helpers used by rendering and writer paths.
+# `fontdb` is currently linked unconditionally because the cheftin text and
+# system-font fallback path references it directly; this feature only toggles
+# the extra shaping dependency surface.
+system-fonts = ["dep:rustybuzz"]
 
 # Digital signatures (create and verify PDF signatures)
 signatures = [
@@ -408,6 +410,10 @@ office = ["dep:calamine", "dep:zip"]
 
 # Parallel page extraction via rayon
 parallel = ["dep:rayon"]
+
+# Optional FreeType backend for embedded raw Type1 glyph bounding boxes.
+type1-freetype = ["dep:freetype-rs"]
+type1-freetype-bundled = ["type1-freetype", "freetype-rs/bundled"]
 
 [profile.release]
 opt-level = 3

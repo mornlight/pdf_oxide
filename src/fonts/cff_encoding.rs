@@ -532,10 +532,27 @@ fn parse_dict_operand(data: &[u8], pos: usize) -> Option<(i32, usize)> {
     }
 }
 
-/// Parse a CFF Top DICT to extract encoding and charset offsets.
-fn parse_top_dict(dict_data: &[u8]) -> (i32, i32) {
-    let mut encoding_offset: i32 = 0; // Default: StandardEncoding
-    let mut charset_offset: i32 = 0; // Default: ISOAdobe charset
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TopDictInfo {
+    encoding_offset: i32,
+    charset_offset: i32,
+    charstrings_offset: i32,
+    is_cid_font: bool,
+}
+
+impl Default for TopDictInfo {
+    fn default() -> Self {
+        Self {
+            encoding_offset: 0, // Default: StandardEncoding
+            charset_offset: 0,  // Default: ISOAdobe charset
+            charstrings_offset: 0,
+            is_cid_font: false,
+        }
+    }
+}
+
+fn parse_top_dict_info(dict_data: &[u8]) -> TopDictInfo {
+    let mut info = TopDictInfo::default();
 
     let mut pos = 0;
     let mut operand_stack: Vec<i32> = Vec::new();
@@ -558,14 +575,24 @@ fn parse_top_dict(dict_data: &[u8]) -> (i32, i32) {
                 16 => {
                     // Encoding (operator 16)
                     if let Some(&val) = operand_stack.last() {
-                        encoding_offset = val;
+                        info.encoding_offset = val;
                     }
                 },
                 15 => {
                     // charset (operator 15)
                     if let Some(&val) = operand_stack.last() {
-                        charset_offset = val;
+                        info.charset_offset = val;
                     }
+                },
+                17 => {
+                    // CharStrings (operator 17)
+                    if let Some(&val) = operand_stack.last() {
+                        info.charstrings_offset = val;
+                    }
+                },
+                0x0C1E => {
+                    // ROS (12 30) marks a CID-keyed CFF.
+                    info.is_cid_font = true;
                 },
                 _ => {},
             }
@@ -580,7 +607,13 @@ fn parse_top_dict(dict_data: &[u8]) -> (i32, i32) {
         }
     }
 
-    (encoding_offset, charset_offset)
+    info
+}
+
+/// Parse a CFF Top DICT to extract encoding and charset offsets.
+fn parse_top_dict(dict_data: &[u8]) -> (i32, i32) {
+    let info = parse_top_dict_info(dict_data);
+    (info.encoding_offset, info.charset_offset)
 }
 
 /// Parse the CFF charset table.
@@ -736,7 +769,7 @@ fn resolve_glyph_name<'a>(sid: u16, string_index: &'a [&'a [u8]]) -> Option<Stri
 
 /// Extract the CFF table from an OpenType (sfnt) wrapper.
 /// Returns the CFF data slice if found, or None if the data isn't an sfnt container.
-fn extract_cff_from_opentype(data: &[u8]) -> Option<&[u8]> {
+pub(crate) fn extract_cff_from_opentype(data: &[u8]) -> Option<&[u8]> {
     if data.len() < 12 {
         return None;
     }
@@ -968,6 +1001,113 @@ pub fn parse_cff_gid_mapping(font_data: &[u8]) -> Option<HashMap<u8, u16>> {
 
     // Custom encoding: parse byte_code → GID mapping directly
     parse_encoding_table(cff_data, encoding_offset as usize)
+}
+
+/// Parse a CFF font program and return a glyph_name → glyph_id mapping.
+///
+/// This is primarily used for simple `/Type1` fonts backed by `FontFile3`
+/// CFF/Type1C streams, where the PDF encoding dictionary provides byte_code →
+/// glyph_name mappings via `/Differences`, and we need to bridge those names
+/// back to glyph ids in the embedded subset font.
+pub(crate) fn parse_cff_glyph_name_gid_mapping(font_data: &[u8]) -> Option<HashMap<String, u16>> {
+    if font_data.len() < 4 {
+        return None;
+    }
+
+    let cff_data = if font_data[0] != 1 {
+        extract_cff_from_opentype(font_data)?
+    } else {
+        font_data
+    };
+
+    if cff_data.len() < 4 || cff_data[0] != 1 {
+        return None;
+    }
+
+    let hdr_size = cff_data[2] as usize;
+    let (_, after_name) = parse_index(cff_data, hdr_size)?;
+    let (top_dicts, after_top_dict) = parse_index(cff_data, after_name)?;
+    let top_dict = top_dicts.first().copied()?;
+    let info = parse_top_dict_info(top_dict);
+    if info.is_cid_font || info.charstrings_offset <= 0 {
+        return None;
+    }
+
+    let (string_index, _) = parse_index(cff_data, after_top_dict)?;
+    let (charstrings, _) = parse_index(cff_data, info.charstrings_offset as usize)?;
+    let num_glyphs = charstrings.len();
+    if num_glyphs == 0 {
+        return None;
+    }
+
+    let charset_sids = if info.charset_offset == 0 {
+        (0..num_glyphs as u16).collect()
+    } else if info.charset_offset == 1 || info.charset_offset == 2 {
+        return None;
+    } else {
+        parse_charset(cff_data, info.charset_offset as usize, num_glyphs)?
+    };
+
+    let mut map = HashMap::new();
+    for (gid, &sid) in charset_sids.iter().enumerate().skip(1) {
+        let Some(glyph_name) = resolve_glyph_name(sid, &string_index) else {
+            continue;
+        };
+        map.entry(glyph_name).or_insert(gid as u16);
+    }
+
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
+    }
+}
+
+/// Parse a CID-keyed CFF font program and return a CID → glyph_id mapping.
+///
+/// The CFF charset encodes `gid -> cid`, so for `CIDFontType0` glyph metrics we
+/// need to unpack that table and reverse it.
+pub(crate) fn parse_cff_cid_gid_mapping(font_data: &[u8]) -> Option<HashMap<u16, u16>> {
+    if font_data.len() < 4 {
+        return None;
+    }
+
+    let cff_data = if font_data[0] != 1 {
+        extract_cff_from_opentype(font_data)?
+    } else {
+        font_data
+    };
+
+    if cff_data.len() < 4 || cff_data[0] != 1 {
+        return None;
+    }
+
+    let hdr_size = cff_data[2] as usize;
+    let (_, after_name) = parse_index(cff_data, hdr_size)?;
+    let (top_dicts, _) = parse_index(cff_data, after_name)?;
+    let top_dict = top_dicts.first().copied()?;
+    let info = parse_top_dict_info(top_dict);
+    if !info.is_cid_font || info.charset_offset <= 2 || info.charstrings_offset <= 0 {
+        return None;
+    }
+
+    let (charstrings, _) = parse_index(cff_data, info.charstrings_offset as usize)?;
+    let num_glyphs = charstrings.len();
+    if num_glyphs == 0 {
+        return None;
+    }
+
+    let gid_to_cid = parse_charset(cff_data, info.charset_offset as usize, num_glyphs)?;
+    let mut cid_to_gid = HashMap::new();
+    for (gid, &cid) in gid_to_cid.iter().enumerate().skip(1) {
+        cid_to_gid.entry(cid).or_insert(gid as u16);
+    }
+
+    if cid_to_gid.is_empty() {
+        None
+    } else {
+        Some(cid_to_gid)
+    }
 }
 
 #[cfg(test)]
@@ -1342,6 +1482,15 @@ mod tests {
         let (enc, charset) = parse_top_dict(&data);
         assert_eq!(enc, 0); // not set
         assert_eq!(charset, 0); // not set
+    }
+
+    #[test]
+    fn test_parse_top_dict_info_detects_cidfont_and_charstrings_offset() {
+        let data = [139, 139, 139, 12, 30, 28, 0, 99, 15, 28, 0, 77, 17];
+        let info = parse_top_dict_info(&data);
+        assert!(info.is_cid_font);
+        assert_eq!(info.charset_offset, 99);
+        assert_eq!(info.charstrings_offset, 77);
     }
 
     #[test]
@@ -1816,5 +1965,53 @@ mod tests {
         assert!(parse_cff_gid_mapping(&[]).is_none());
         assert!(parse_cff_gid_mapping(&[0, 1, 2]).is_none());
         assert!(parse_cff_gid_mapping(&[2, 0, 4, 2]).is_none()); // wrong version
+    }
+
+    #[test]
+    fn test_parse_cff_cid_gid_mapping_invalid_data() {
+        assert!(parse_cff_cid_gid_mapping(&[]).is_none());
+        assert!(parse_cff_cid_gid_mapping(&[0, 1, 2]).is_none());
+    }
+
+    #[test]
+    fn test_parse_cff_cid_gid_mapping_for_cid_keyed_charset() {
+        let mut data = vec![1, 0, 4, 1];
+        append_index(&mut data, &[b"TestCID"]);
+
+        let charset_len = 1 + 2 * 2;
+        let top_dict_len = 13usize;
+        let top_dict_index_len = 2 + 1 + 2 + top_dict_len;
+        let prefix_len = 4 + 12 + top_dict_index_len + 2 + 2;
+        let charset_offset = prefix_len as u16;
+        let charstrings_offset = (prefix_len + charset_len) as u16;
+
+        let top_dict = vec![
+            139,
+            139,
+            139,
+            12,
+            30,
+            28,
+            (charset_offset >> 8) as u8,
+            (charset_offset & 0xFF) as u8,
+            15,
+            28,
+            (charstrings_offset >> 8) as u8,
+            (charstrings_offset & 0xFF) as u8,
+            17,
+        ];
+        append_index(&mut data, &[&top_dict]);
+        append_index(&mut data, &[]);
+        append_index(&mut data, &[]);
+
+        data.push(0);
+        data.extend_from_slice(&400u16.to_be_bytes());
+        data.extend_from_slice(&401u16.to_be_bytes());
+
+        data.extend_from_slice(&[0, 3, 1, 1, 1, 1, 1]);
+
+        let cid_to_gid = parse_cff_cid_gid_mapping(&data).unwrap();
+        assert_eq!(cid_to_gid.get(&400), Some(&1));
+        assert_eq!(cid_to_gid.get(&401), Some(&2));
     }
 }

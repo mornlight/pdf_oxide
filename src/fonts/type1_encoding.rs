@@ -26,6 +26,18 @@ use std::collections::HashMap;
 /// Returns a HashMap mapping character codes (u8) to Unicode characters,
 /// or None if no custom encoding is found.
 pub fn parse_type1_encoding(font_data: &[u8]) -> Option<HashMap<u8, char>> {
+    parse_type1_glyph_names(font_data).map(|glyph_names| {
+        glyph_names
+            .into_iter()
+            .filter_map(|(code, glyph_name)| {
+                super::font_dict::glyph_name_to_unicode(&glyph_name).map(|ch| (code, ch))
+            })
+            .collect()
+    })
+}
+
+/// Parse a Type 1 built-in encoding table into PostScript glyph names.
+pub(crate) fn parse_type1_glyph_names(font_data: &[u8]) -> Option<HashMap<u8, String>> {
     // Find the /Encoding keyword in the clear text section.
     // The clear text section ends at "currentfile eexec" or at binary data.
     // We search within the first portion of the file (clear text is typically <10KB).
@@ -44,7 +56,7 @@ pub fn parse_type1_encoding(font_data: &[u8]) -> Option<HashMap<u8, char>> {
     }
 
     // Scan for "dup CODE /GLYPHNAME put" patterns starting from /Encoding
-    let mut encoding_map = HashMap::new();
+    let mut glyph_names = HashMap::new();
     let mut pos = encoding_pos;
 
     while pos < search_limit {
@@ -65,9 +77,7 @@ pub fn parse_type1_encoding(font_data: &[u8]) -> Option<HashMap<u8, char>> {
         // Parse: whitespace CODE whitespace /GLYPHNAME whitespace put
         let remaining = &search_data[pos..search_limit.min(search_data.len())];
         if let Some((code, glyph_name, consumed)) = parse_dup_entry(remaining) {
-            if let Some(unicode_char) = super::font_dict::glyph_name_to_unicode(&glyph_name) {
-                encoding_map.insert(code, unicode_char);
-            }
+            glyph_names.insert(code, glyph_name);
             pos += consumed;
         }
 
@@ -79,11 +89,11 @@ pub fn parse_type1_encoding(font_data: &[u8]) -> Option<HashMap<u8, char>> {
         }
     }
 
-    if encoding_map.is_empty() {
+    if glyph_names.is_empty() {
         None
     } else {
-        log::debug!("Type 1 built-in encoding parsed: {} character mappings", encoding_map.len());
-        Some(encoding_map)
+        log::debug!("Type 1 built-in encoding parsed: {} glyph-name mappings", glyph_names.len());
+        Some(glyph_names)
     }
 }
 
@@ -244,5 +254,18 @@ mod tests {
         assert_eq!(map.get(&48), Some(&'0'));
         assert_eq!(map.get(&58), Some(&':'));
         assert_eq!(map.get(&123), Some(&'\u{2013}')); // endash
+    }
+
+    #[test]
+    fn test_parse_type1_glyph_names_basic() {
+        let font_data = b"/Encoding 256 array\n\
+            0 1 255 {1 index exch /.notdef put} for\n\
+            dup 33 /exclam put\n\
+            dup 65 /A put\n\
+            readonly def\n";
+
+        let names = parse_type1_glyph_names(font_data).unwrap();
+        assert_eq!(names.get(&33).map(String::as_str), Some("exclam"));
+        assert_eq!(names.get(&65).map(String::as_str), Some("A"));
     }
 }

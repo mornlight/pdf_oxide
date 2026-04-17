@@ -21,15 +21,19 @@ pub mod encoding;
 pub mod encoding_normalizer;
 pub mod font_dict; // Private module - only used internally by font_dict
 pub mod font_subsetter;
+pub(crate) mod glyph_backend;
 /// Process-level cross-document font cache for batch processing.
 pub mod global_cache;
 pub mod non_text_detection;
+pub(crate) mod system_font;
 /// TrueType font CMap parsing for glyph-to-character mapping.
 pub mod truetype_cmap;
 /// TrueType/OpenType font parser for PDF embedding (v0.3.0).
 pub mod truetype_parser;
 /// Type 1 font encoding parser for extracting built-in encoding from FontFile data.
 pub mod type1_encoding;
+#[cfg(feature = "type1-freetype")]
+pub(crate) mod type1_freetype;
 
 pub use character_mapper::{CharacterMapper, PredefinedCMapConfig};
 pub use cmap::{parse_tounicode_cmap, CMap, LazyCMap};
