@@ -6844,19 +6844,16 @@ impl PdfDocument {
         self.require_authenticated()?;
         use crate::extractors::TextExtractor;
 
-        // Get page object
         let page = self.get_page(page_index)?;
         let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
             offset: 0,
             reason: "Page is not a dictionary".to_string(),
         })?;
 
-        // Fast pre-check: skip pages that cannot produce text based on resources alone.
         if self.page_cannot_have_text(page_dict) {
             return Ok(Vec::new());
         }
 
-        // Get content stream data — skip page on decode failure (Annex I)
         let content_data = match self.get_page_content_data(page_index) {
             Ok(data) => data,
             Err(e) => {
@@ -6869,7 +6866,6 @@ impl PdfDocument {
             },
         };
 
-        // Single-pass extraction with the provided config
         if !Self::may_contain_text(&content_data) {
             return Ok(Vec::new());
         }
@@ -7153,14 +7149,16 @@ impl PdfDocument {
     pub fn extract_chars(&mut self, page_index: usize) -> Result<Vec<crate::layout::TextChar>> {
         use crate::extractors::TextExtractor;
 
-        // Get page object
         let page = self.get_page(page_index)?;
         let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
             offset: 0,
             reason: "Page is not a dictionary".to_string(),
         })?;
 
-        // Get content stream data — skip page on decode failure (Annex I)
+        if self.page_cannot_have_text(page_dict) {
+            return Ok(Vec::new());
+        }
+
         let content_data = match self.get_page_content_data(page_index) {
             Ok(data) => data,
             Err(e) => {
@@ -7173,20 +7171,15 @@ impl PdfDocument {
             },
         };
 
-        // Early-out for pages with no text content (§9.4.3)
         if !Self::may_contain_text(&content_data) {
             return Ok(Vec::new());
         }
 
-        // Create text extractor for character-level extraction
         let mut extractor = TextExtractor::new();
-
-        // Load fonts from page resources and set resources for XObject access
         if let Some(resources) = page_dict.get("Resources") {
             extractor.set_resources(resources.clone());
             extractor.set_document(self as *const PdfDocument);
 
-            // Load fonts
             if let Err(e) = self.load_fonts(resources, &mut extractor) {
                 log::warn!(
                     "Failed to load fonts for page {}: {}, continuing with defaults",
@@ -7196,22 +7189,9 @@ impl PdfDocument {
             }
         }
 
-        // Extract characters directly (single-pass, no document classification)
-        let mut chars = extractor.extract(&content_data)?;
-
-        // Sort characters by reading order (Y-descending, then X-ascending)
-        // This ensures extract_words and extract_text_lines process them in logical order.
-        chars.sort_by(|a, b| {
-            // Y-descending (top-to-bottom)
-            let y_cmp = crate::utils::safe_float_cmp(b.bbox.y, a.bbox.y);
-            if y_cmp != std::cmp::Ordering::Equal {
-                return y_cmp;
-            }
-            // X-ascending (left-to-right)
-            crate::utils::safe_float_cmp(a.bbox.x, b.bbox.x)
-        });
-
-        Ok(chars)
+        // Character extraction keeps the public reading-order behavior expected by
+        // the upstream API.
+        extractor.extract(&content_data)
     }
 
     /// Extract words from a page.
@@ -11575,6 +11555,49 @@ mod tests {
         pdf
     }
 
+    /// Build a minimal PDF with a single standard Type1 font resource named /F1.
+    fn build_minimal_text_pdf(content: &[u8]) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+
+        let off1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
+        );
+
+        let off4 = pdf.len();
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let off5 = pdf.len();
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        let xref_off = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 6\n");
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off1).as_bytes());
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off2).as_bytes());
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off3).as_bytes());
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off4).as_bytes());
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off5).as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off)
+                .as_bytes(),
+        );
+
+        pdf
+    }
+
     fn build_pdf_with_extra_objects(
         content: &[u8],
         extra_objects: Vec<(usize, Vec<u8>)>,
@@ -12097,6 +12120,54 @@ mod tests {
             chars.is_empty(),
             "extract_chars() should honor page_cannot_have_text() and skip pages without font resources"
         );
+    }
+
+    #[test]
+    fn test_extract_chars_keeps_descender_text_order_stable() {
+        let content = b"BT /F1 12 Tf 72 700 Td (ga) Tj ET";
+        let pdf = build_minimal_text_pdf(content);
+        let mut doc = PdfDocument::from_bytes(pdf).unwrap();
+
+        let chars = doc.extract_chars(0).unwrap();
+        let text = chars.iter().map(|ch| ch.char).collect::<String>();
+
+        assert_eq!(text, "ga");
+    }
+
+    #[test]
+    fn test_extract_chars_keeps_descender_text_order_for_standard_word() {
+        let bytes = crate::api::Pdf::from_text("gapy").unwrap().into_bytes();
+        let mut doc = PdfDocument::from_bytes(bytes).unwrap();
+
+        let chars = doc.extract_chars(0).unwrap();
+        let text = chars.iter().map(|ch| ch.char).collect::<String>();
+
+        assert_eq!(text, "gapy");
+    }
+
+    #[test]
+    fn test_extract_chars_does_not_insert_synthetic_tj_spaces() {
+        let content = b"BT /F1 12 Tf 72 700 Td [(Hello) -500 (World)] TJ ET";
+        let pdf = build_minimal_text_pdf(content);
+        let mut doc = PdfDocument::from_bytes(pdf).unwrap();
+
+        let chars = doc.extract_chars(0).unwrap();
+        let text = chars.iter().map(|ch| ch.char).collect::<String>();
+
+        assert_eq!(text, "HelloWorld");
+        assert!(chars.iter().all(|ch| ch.char != ' '));
+    }
+
+    #[test]
+    fn test_extract_chars_sorts_same_line_text_in_reading_order() {
+        let content = b"BT /F1 12 Tf 200 700 Td (B) Tj -100 0 Td (A) Tj ET";
+        let pdf = build_minimal_text_pdf(content);
+        let mut doc = PdfDocument::from_bytes(pdf).unwrap();
+
+        let chars = doc.extract_chars(0).unwrap();
+        let text = chars.iter().map(|ch| ch.char).collect::<String>();
+
+        assert_eq!(text, "AB");
     }
 
     // ========================================================================
