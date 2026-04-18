@@ -345,10 +345,7 @@ pub struct PdfDocument {
     font_name_set_cache: Mutex<
         BoundedEntryCache<
             u64,
-            (
-                Arc<Vec<(String, Arc<crate::fonts::FontInfo>)>>,
-                Arc<Vec<(String, u64)>>,
-            ),
+            (Arc<Vec<(String, Arc<crate::fonts::FontInfo>)>>, Arc<Vec<(String, u64)>>),
         >,
     >,
     /// Per-font identity cache keyed by font_identity_hash (BaseFont + Subtype + Encoding +
@@ -6844,16 +6841,19 @@ impl PdfDocument {
         self.require_authenticated()?;
         use crate::extractors::TextExtractor;
 
+        // Get page object
         let page = self.get_page(page_index)?;
         let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
             offset: 0,
             reason: "Page is not a dictionary".to_string(),
         })?;
 
+        // Fast pre-check: skip pages that cannot produce text based on resources alone.
         if self.page_cannot_have_text(page_dict) {
             return Ok(Vec::new());
         }
 
+        // Get content stream data — skip page on decode failure (Annex I)
         let content_data = match self.get_page_content_data(page_index) {
             Ok(data) => data,
             Err(e) => {
@@ -6870,6 +6870,7 @@ impl PdfDocument {
             return Ok(Vec::new());
         }
 
+        // Single-pass extraction with the provided config
         let mut extractor = TextExtractor::with_config(config);
         if let Some(resources) = page_dict.get("Resources") {
             extractor.set_resources(resources.clone());
@@ -7006,6 +7007,7 @@ impl PdfDocument {
         // Get spans with the requested reading order
         let spans = self.extract_spans_with_reading_order(page_index, reading_order)?;
 
+        // Derive chars from spans (uses char_widths for accurate positioning)
         let chars: Vec<_> = spans.iter().flat_map(|span| span.to_chars()).collect();
 
         // Get page dimensions from MediaBox
@@ -7139,16 +7141,19 @@ impl PdfDocument {
     ) -> Result<Vec<crate::layout::TextSpan>> {
         use crate::extractors::TextExtractor;
 
+        // Get page object
         let page = self.get_page(page_index)?;
         let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
             offset: 0,
             reason: "Page is not a dictionary".to_string(),
         })?;
 
+        // Fast pre-check: skip image-only pages before decompression
         if self.page_cannot_have_text(page_dict) {
             return Ok(Vec::new());
         }
 
+        // Get content stream data — skip page on decode failure (Annex I)
         let content_data = match self.get_page_content_data(page_index) {
             Ok(data) => data,
             Err(e) => {
@@ -7161,15 +7166,19 @@ impl PdfDocument {
             },
         };
 
+        // Early-out for pages with no text content (§9.4.3)
         if !Self::may_contain_text(&content_data) {
             return Ok(Vec::new());
         }
 
+        // Create text extractor with merged configuration
         let mut extractor = TextExtractor::new().with_merging_config(config);
+        // Load fonts from page resources and set resources for XObject access
         if let Some(resources) = page_dict.get("Resources") {
             extractor.set_resources(resources.clone());
             extractor.set_document(self as *const PdfDocument);
 
+            // Load fonts
             if let Err(e) = self.load_fonts(resources, &mut extractor) {
                 log::warn!(
                     "Failed to load fonts for page {}: {}, continuing with defaults",
@@ -7179,6 +7188,7 @@ impl PdfDocument {
             }
         }
 
+        // Extract text spans
         extractor.extract_text_spans(&content_data)
     }
 
@@ -7224,16 +7234,19 @@ impl PdfDocument {
     pub fn extract_chars(&mut self, page_index: usize) -> Result<Vec<crate::layout::TextChar>> {
         use crate::extractors::TextExtractor;
 
+        // Get page object
         let page = self.get_page(page_index)?;
         let page_dict = page.as_dict().ok_or_else(|| Error::ParseError {
             offset: 0,
             reason: "Page is not a dictionary".to_string(),
         })?;
 
+        // Fast pre-check: skip image-only pages before decompression
         if self.page_cannot_have_text(page_dict) {
             return Ok(Vec::new());
         }
 
+        // Get content stream data — skip page on decode failure (Annex I)
         let content_data = match self.get_page_content_data(page_index) {
             Ok(data) => data,
             Err(e) => {
@@ -7246,15 +7259,19 @@ impl PdfDocument {
             },
         };
 
+        // Early-out for pages with no text content (§9.4.3)
         if !Self::may_contain_text(&content_data) {
             return Ok(Vec::new());
         }
 
+        // Create text extractor for character-level extraction
         let mut extractor = TextExtractor::new();
+        // Load fonts from page resources and set resources for XObject access
         if let Some(resources) = page_dict.get("Resources") {
             extractor.set_resources(resources.clone());
             extractor.set_document(self as *const PdfDocument);
 
+            // Load fonts
             if let Err(e) = self.load_fonts(resources, &mut extractor) {
                 log::warn!(
                     "Failed to load fonts for page {}: {}, continuing with defaults",
