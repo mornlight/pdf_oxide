@@ -45,5 +45,9 @@ pub use font_subsetter::{subset_font_bytes, FontSubsetter, GlyphRemapper, Subset
 pub use non_text_detection::{
     CharacterConfidence, ConfidenceReason, NonTextDetector, NonTextStats,
 };
+#[cfg(feature = "system-font-audit")]
+pub use system_font::{reset_system_font_audit, system_font_audit_snapshot, SystemFontAuditEntry};
+#[cfg(feature = "system-font-audit")]
+pub use system_font_cache::{cache_io_audit_snapshot, CacheIoAudit};
 pub use truetype_cmap::TrueTypeCMap;
 pub use truetype_parser::{FontMetrics, TrueTypeError, TrueTypeFont, TrueTypeResult};

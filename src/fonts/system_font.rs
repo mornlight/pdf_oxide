@@ -15,8 +15,8 @@ static SYSTEM_FONT_HOT_ANSWER_CACHE: LazyLock<
 static SYSTEM_FONT_AUDIT: LazyLock<Mutex<Vec<SystemFontAuditEntry>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
-#[derive(Debug, Clone, Serialize)]
 /// One system-font fallback lookup observed during the current process.
+#[derive(Debug, Clone, Serialize)]
 pub struct SystemFontAuditEntry {
     /// The PDF font base name that requested a system fallback face.
     pub pdf_font_name: String,
@@ -33,6 +33,7 @@ fn push_audit_entry(entry: SystemFontAuditEntry) {
 }
 
 /// Clear all recorded system-font fallback audit entries for the current process.
+#[cfg(feature = "system-font-audit")]
 pub fn reset_system_font_audit() {
     if let Ok(mut audit) = SYSTEM_FONT_AUDIT.lock() {
         audit.clear();
@@ -41,6 +42,7 @@ pub fn reset_system_font_audit() {
 }
 
 /// Return a snapshot of recorded system-font fallback audit entries.
+#[cfg(feature = "system-font-audit")]
 pub fn system_font_audit_snapshot() -> Vec<SystemFontAuditEntry> {
     SYSTEM_FONT_AUDIT
         .lock()

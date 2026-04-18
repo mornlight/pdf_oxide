@@ -20,13 +20,20 @@ static TEST_CACHE_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()
 static CACHE_IO_AUDIT: LazyLock<Mutex<CacheIoAudit>> =
     LazyLock::new(|| Mutex::new(CacheIoAudit::default()));
 
+/// Snapshot of system-font cache I/O side effects observed in the current process.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CacheIoAudit {
+    /// Resolved cache directory used for on-disk artifacts, when available.
     pub cache_dir: Option<String>,
+    /// Number of attempts to write the full persisted font index.
     pub full_index_write_attempts: usize,
+    /// Number of successful writes of the full persisted font index.
     pub full_index_write_successes: usize,
+    /// Number of attempts to write the persisted hot-answer cache.
     pub hot_answer_write_attempts: usize,
+    /// Number of successful writes of the persisted hot-answer cache.
     pub hot_answer_write_successes: usize,
+    /// Most recent cache read/write error observed by the helper layer.
     pub last_error: Option<String>,
 }
 
@@ -437,12 +444,16 @@ pub(crate) fn write_hot_answer_cache(
     })
 }
 
+/// Clear the in-process cache I/O audit snapshot.
+#[cfg(feature = "system-font-audit")]
 pub fn reset_cache_io_audit() {
     if let Ok(mut audit) = CACHE_IO_AUDIT.lock() {
         *audit = CacheIoAudit::default();
     }
 }
 
+/// Return the current in-process cache I/O audit snapshot.
+#[cfg(feature = "system-font-audit")]
 pub fn cache_io_audit_snapshot() -> CacheIoAudit {
     CACHE_IO_AUDIT
         .lock()
