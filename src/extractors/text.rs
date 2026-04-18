@@ -2107,7 +2107,7 @@ fn sanitize_extracted_unicode_char(ch: char) -> Option<char> {
     match ch {
         '\0' => None,
         '\t' | '\n' | '\r' => Some(ch),
-        _ if ch.is_control() => Some('\u{FFFD}'),
+        _ if ch.is_control() => None,
         _ => Some(ch),
     }
 }
@@ -2257,7 +2257,15 @@ fn decode_text_to_unicode(bytes: &[u8], font: Option<&FontInfo>) -> String {
         bytes.iter().map(|&b| char::from(b)).collect()
     };
 
-    sanitize_extracted_unicode_string(&raw_result)
+    // Filter control characters from failed encoding resolution
+    // Keep: \t (0x09), \n (0x0A), \r (0x0D), and all printable chars (>= 0x20)
+    let mut filtered = String::with_capacity(raw_result.len());
+    for c in raw_result.chars() {
+        if c >= '\x20' || c == '\t' || c == '\n' || c == '\r' {
+            filtered.push(c);
+        }
+    }
+    filtered
 }
 
 fn collect_tj_string_bytes(array: &[TextElement]) -> Vec<u8> {
@@ -2340,30 +2348,67 @@ pub struct TextExtractor {
     spans: Vec<TextSpan>,
     /// Extracted characters (for backward compatibility)
     chars: Vec<TextChar>,
-    /// Runtime state for XObject/resource resolution.
+    /// Resources dictionary (for accessing XObjects and fonts)
     resources: Option<Object>,
+    /// Reference to the document (for loading XObjects)
     document: Option<*const crate::document::PdfDocument>,
     /// Set of processed (XObject ref, caller CTM) pairs to avoid duplicate work
     /// while still allowing the same Form XObject to be painted at distinct positions.
     processed_xobjects: HashSet<(ObjectRef, [i64; 6])>,
     cached_xobject_refs: HashMap<String, Option<ObjectRef>>,
+    /// Current XObject recursion depth (0 = page level)
     xobject_depth: u32,
+    /// Number of XObjects decoded on this page (for budget limiting)
     xobject_decode_count: u32,
     /// Configuration for text extraction heuristics
     config: TextExtractionConfig,
     /// Configuration for span merging behavior
     merging_config: SpanMergingConfig,
-    /// Runtime state for marked-content / artifact tracking.
+    /// Current marked content ID (for Tagged PDFs)
+    ///
+    /// Tracks the MCID of the currently active marked content sequence.
+    /// Used to associate extracted text with structure tree elements.
     current_mcid: Option<u32>,
+    /// Stack of marked content contexts (per PDF Spec Section 14.6)
+    ///
+    /// Tracks nested marked content tags to enable artifact filtering.
+    /// When content is marked as `/Artifact`, it should be excluded from text extraction.
     marked_content_stack: Vec<MarkedContentContext>,
+    /// Whether we're currently inside an /Artifact marked content context
+    ///
+    /// Per PDF Spec Section 14.6, artifact content should be excluded from text extraction.
+    /// This flag is true when any ancestor in the marked_content_stack has is_artifact=true.
     inside_artifact: bool,
-    /// Runtime state for span-mode extraction and Tj buffering.
+    /// Extraction mode: true for spans, false for characters
     extract_spans: bool,
+    /// Buffer for accumulating consecutive Tj operators into single spans
+    ///
+    /// Per PDF Spec ISO 32000-1:2008 Section 9.4.4 NOTE 6, text strings should
+    /// be as long as possible. This buffer accumulates consecutive Tj operators
+    /// until a positioning command or state change is encountered.
     tj_span_buffer: Option<TjBuffer>,
+    /// Sequence counter for TextSpan ordering
+    ///
+    /// Used as a tie-breaker when sorting spans by Y-coordinate. Ensures
+    /// that spans with identical Y-coordinates maintain extraction order.
     span_sequence_counter: usize,
-    /// Runtime state for TJ-array character tracking and statistics.
+    /// History of TJ array offsets for statistical analysis
+    ///
+    /// Tracks TJ offset values to detect justified vs. normal text through
+    /// statistical distribution analysis (coefficient of variation).
+    /// Used to dynamically adjust spacing thresholds per ISO 32000-1:2008 Section 9.4.4.
     tj_offset_history: Vec<f32>,
+    /// Character-level tracking for word boundary detection
+    ///
+    /// Collects CharacterInfo for each character during TJ array processing.
+    /// This provides character-level positioning, width, and TJ offset data
+    /// to WordBoundaryDetector for primary word boundary detection.
+    /// Per ISO 32000-1:2008 Section 9.4.4, character-level analysis improves accuracy.
     tj_character_array: Vec<CharacterInfo>,
+    /// Current X position in text space for character tracking
+    ///
+    /// Updated as each character in a TJ array is processed. Used to calculate
+    /// x_position for CharacterInfo entries (not used after character collection).
     current_x_position: f32,
     /// Word boundary detection mode
     ///
@@ -2371,7 +2416,8 @@ pub struct TextExtractor {
     /// - Tiebreaker: Only when TJ and geometric signals conflict (default)
     /// - Primary: Before creating TextSpans from tj_character_array
     word_boundary_mode: WordBoundaryMode,
-    /// Cached current font for fast lookups and precise bbox state management.
+    /// Cached current font (updated on Tf). Avoids per-Tj HashMap lookup
+    /// in advance_position_for_string.
     cached_current_font: Option<Arc<FontInfo>>,
     /// Short-lived runtime used only during a single extraction pass.
     text_runtime: Option<TextRunRuntime>,
@@ -7282,13 +7328,19 @@ impl TextExtractor {
             let final_matrix = text_matrix.multiply(&ctm);
             let rotation_degrees = final_matrix.b.atan2(final_matrix.a).to_degrees();
 
-            // Guard against malformed fonts
-            let unicode_string =
-                sanitize_extracted_unicode_string(&if unicode_string.chars().count() > 8 {
-                    unicode_string.chars().next().unwrap_or('?').to_string()
-                } else {
-                    unicode_string
-                });
+            // Guard against malformed fonts.
+            // Keep cheftin's char-object coverage safeguard: if a visible glyph maps
+            // to a control-only Unicode string, emit a placeholder instead of silently
+            // dropping the character from public char-extraction paths.
+            let guarded_unicode = if unicode_string.chars().count() > 8 {
+                unicode_string.chars().next().unwrap_or('?').to_string()
+            } else {
+                unicode_string
+            };
+            let mut unicode_string = sanitize_extracted_unicode_string(&guarded_unicode);
+            if unicode_string.is_empty() && !guarded_unicode.is_empty() {
+                unicode_string.push('\u{FFFD}');
+            }
 
             // Process each character in the expanded string (ligatures)
             let char_count = unicode_string.chars().count();
