@@ -191,6 +191,9 @@ default = []
 # Enable logging for the extraction pipeline
 logging = []
 
+# Expose system font fallback/cache audit APIs for bench/debug tooling.
+system-font-audit = []
+
 # Python bindings (v0.1.0)
 python = ["pyo3", "pyo3-log", "rendering", "parallel", "logging", "signatures", "barcodes", "office"]
 
