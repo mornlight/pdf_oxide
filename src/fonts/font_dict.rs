@@ -438,10 +438,20 @@ impl FontInfo {
                             .and_then(|weight_obj| weight_obj.as_integer())
                             .map(|w| w as i32);
 
-                        let descriptor_flags = descriptor_dict
+                        let mut descriptor_flags = descriptor_dict
                             .get("Flags")
                             .and_then(|flags_obj| flags_obj.as_integer())
                             .map(|f| f as i32);
+
+                        let italic_angle = descriptor_dict.get("ItalicAngle").and_then(|obj| {
+                            obj.as_real()
+                                .map(|r| r as f32)
+                                .or_else(|| obj.as_integer().map(|i| i as f32))
+                        });
+                        if italic_angle.is_some_and(|angle| angle < -0.1 || angle > 0.1) {
+                            const ITALIC_BIT: i32 = 1 << 6;
+                            descriptor_flags = Some(descriptor_flags.unwrap_or(0) | ITALIC_BIT);
+                        }
 
                         let stem_v_value = descriptor_dict.get("StemV").and_then(|sv_obj| {
                             sv_obj
@@ -879,15 +889,7 @@ impl FontInfo {
                         base_font,
                         e
                     );
-                    (
-                        Some(CIDToGIDMap::Identity),
-                        None,
-                        None,
-                        None,
-                        1000.0,
-                        false,
-                        None,
-                    )
+                    (Some(CIDToGIDMap::Identity), None, None, None, 1000.0, false, None)
                 },
             }
         } else {
@@ -3275,10 +3277,62 @@ impl FontInfo {
 
     /// Check if this font is likely italic based on the font name.
     ///
-    /// This is a heuristic check looking for "Italic" or "Oblique" in the font name.
+    /// This is a heuristic check looking for common italic markers in the font name.
     pub fn is_italic(&self) -> bool {
-        let name_lower = self.base_font.to_lowercase();
-        name_lower.contains("italic") || name_lower.contains("oblique")
+        let font_name = self
+            .base_font
+            .split_once('+')
+            .map(|(_, name)| name)
+            .unwrap_or(&self.base_font);
+        let name_lower = font_name.to_ascii_lowercase();
+        if name_lower.contains("italic") || name_lower.contains("oblique") {
+            return true;
+        }
+        if name_lower.starts_with("cmmi") || name_lower.starts_with("cmsy") {
+            const ITALIC_BIT: i32 = 1 << 6;
+            if let Some(flags) = self.flags {
+                return (flags & ITALIC_BIT) != 0;
+            }
+            return self
+                .embedded_font_italic_angle()
+                .map(|angle| angle < -0.1 || angle > 0.1)
+                .unwrap_or(true);
+        }
+
+        font_name
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter(|part| !part.is_empty())
+            .any(|part| {
+                let part_lower = part.to_ascii_lowercase();
+                part_lower == "ital"
+                    || part_lower == "it"
+                    || part.ends_with("Ital")
+                    || part.ends_with("ITAL")
+            })
+    }
+
+    fn embedded_font_italic_angle(&self) -> Option<f32> {
+        let font_data = self.embedded_font_data.as_deref()?;
+        let marker = b"/ItalicAngle";
+        let marker_start = font_data
+            .windows(marker.len())
+            .position(|window| window == marker)?
+            + marker.len();
+        let mut value_start = marker_start;
+        while value_start < font_data.len() && font_data[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+        let mut value_end = value_start;
+        while value_end < font_data.len()
+            && (font_data[value_end].is_ascii_digit()
+                || matches!(font_data[value_end], b'-' | b'+' | b'.'))
+        {
+            value_end += 1;
+        }
+        std::str::from_utf8(&font_data[value_start..value_end])
+            .ok()?
+            .parse::<f32>()
+            .ok()
     }
 
     /// Check if this is a symbolic font based on FontDescriptor flags.
@@ -4578,6 +4632,68 @@ mod tests {
             byte_to_width_table: std::sync::OnceLock::new(),
         };
         assert!(font2.is_italic());
+    }
+
+    #[test]
+    fn test_font_info_is_italic_recognizes_common_name_abbreviations() {
+        let font = make_font(|font| font.base_font = "URWPalladioL-Ital".to_string());
+        assert!(font.is_italic());
+
+        let font = make_font(|font| font.base_font = "NimbusSanL-ReguItal".to_string());
+        assert!(font.is_italic());
+
+        let font = make_font(|font| font.base_font = "MyriadPro-It".to_string());
+        assert!(font.is_italic());
+
+        let font = make_font(|font| font.base_font = "CMMI10".to_string());
+        assert!(font.is_italic());
+
+        let font = make_font(|font| font.base_font = "CMSY8".to_string());
+        assert!(font.is_italic());
+
+        let font = make_font(|font| font.base_font = "ABCDEF+CMMI10".to_string());
+        assert!(font.is_italic());
+
+        let font = make_font(|font| font.base_font = "ABCDEF+CMSY8".to_string());
+        assert!(font.is_italic());
+
+        let font = make_font(|font| font.base_font = "DigitalSans".to_string());
+        assert!(!font.is_italic());
+    }
+
+    #[test]
+    fn test_math_font_italic_detection_prefers_embedded_italic_angle() {
+        let font = make_font(|font| {
+            font.base_font = "ABCDEF+CMMI10".to_string();
+            font.embedded_font_data = Some(Arc::new(b"/ItalicAngle 0 def".to_vec()));
+        });
+        assert!(!font.is_italic());
+
+        let font = make_font(|font| {
+            font.base_font = "ABCDEF+CMSY8".to_string();
+            font.embedded_font_data = Some(Arc::new(b"/ItalicAngle -14.04 def".to_vec()));
+        });
+        assert!(font.is_italic());
+
+        let font = make_font(|font| {
+            font.base_font = "ABCDEF+CMMI10".to_string();
+            let mut data = vec![0, 159, 255];
+            data.extend_from_slice(b"/ItalicAngle 0 def");
+            font.embedded_font_data = Some(Arc::new(data));
+        });
+        assert!(!font.is_italic());
+
+        let font = make_font(|font| {
+            font.base_font = "ABCDEF+CMMI10".to_string();
+            font.flags = Some(4);
+        });
+        assert!(!font.is_italic());
+
+        let font = make_font(|font| {
+            font.base_font = "ABCDEF+CMMI10".to_string();
+            font.flags = Some(4 | (1 << 6));
+        });
+        assert!(font.is_italic());
     }
 
     #[test]
