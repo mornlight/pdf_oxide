@@ -7,7 +7,7 @@
 //! - no reading-order reflow is implied by this data model
 
 use crate::geometry::Rect;
-use crate::layout::text_block::{Color, FontWeight};
+use crate::layout::text_block::{Color, FontWeight, TextChar};
 
 /// A resolved character with precise text and bounding box data.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -17,9 +17,28 @@ pub struct ResolvedChar {
     pub text: char,
     /// Character bounding box in PDF user space.
     pub bbox: Rect,
+    /// Baseline origin X coordinate in PDF user space.
+    pub origin_x: f32,
+    /// Baseline origin Y coordinate in PDF user space.
+    pub origin_y: f32,
+    /// Horizontal advance width in PDF user space.
+    pub advance_width: f32,
     /// Optional rendered rotation in degrees.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rotation_degrees: Option<f32>,
+}
+
+impl ResolvedChar {
+    pub(crate) fn from_text_char(text_char: &TextChar) -> Self {
+        Self {
+            text: text_char.char,
+            bbox: text_char.bbox,
+            origin_x: text_char.origin_x,
+            origin_y: text_char.origin_y,
+            advance_width: text_char.advance_width,
+            rotation_degrees: Some(text_char.rotation_degrees),
+        }
+    }
 }
 
 /// Shared style attributes for a resolved span.
@@ -102,7 +121,7 @@ impl ResolvedSpan {
 mod tests {
     use super::{ResolvedChar, ResolvedSpan, ResolvedStyle};
     use crate::geometry::Rect;
-    use crate::layout::{Color, FontWeight};
+    use crate::layout::{Color, FontWeight, TextChar};
 
     fn style() -> ResolvedStyle {
         ResolvedStyle {
@@ -128,11 +147,17 @@ mod tests {
                 ResolvedChar {
                     text: 'A',
                     bbox: Rect::new(10.0, 20.0, 5.0, 8.0),
+                    origin_x: 10.0,
+                    origin_y: 20.0,
+                    advance_width: 5.0,
                     rotation_degrees: Some(0.0),
                 },
                 ResolvedChar {
                     text: 'B',
                     bbox: Rect::new(16.0, 18.0, 4.0, 10.0),
+                    origin_x: 16.0,
+                    origin_y: 18.0,
+                    advance_width: 4.0,
                     rotation_degrees: Some(0.0),
                 },
             ],
@@ -142,6 +167,33 @@ mod tests {
         assert_eq!(span.sequence, 7);
         assert_eq!(span.mcid, Some(3));
         assert_eq!(span.bbox, Rect::new(10.0, 18.0, 10.0, 10.0));
+    }
+
+    #[test]
+    fn resolved_char_preserves_text_origin_box_separately_from_glyph_bbox() {
+        let text_char = TextChar {
+            char: 'g',
+            bbox: Rect::new(11.0, 16.0, 4.0, 9.0),
+            font_name: "Helvetica".to_string(),
+            font_size: 12.0,
+            font_weight: FontWeight::Normal,
+            is_italic: false,
+            is_monospace: false,
+            color: Color::black(),
+            mcid: None,
+            origin_x: 10.0,
+            origin_y: 20.0,
+            rotation_degrees: 0.0,
+            advance_width: 6.0,
+            matrix: None,
+        };
+
+        let resolved = ResolvedChar::from_text_char(&text_char);
+
+        assert_eq!(resolved.bbox, Rect::new(11.0, 16.0, 4.0, 9.0));
+        assert_eq!(resolved.origin_x, 10.0);
+        assert_eq!(resolved.origin_y, 20.0);
+        assert_eq!(resolved.advance_width, 6.0);
     }
 
     #[test]

@@ -2719,6 +2719,18 @@ impl PyResolvedChar {
         )
     }
     #[getter]
+    fn origin_x(&self) -> f32 {
+        self.inner.origin_x
+    }
+    #[getter]
+    fn origin_y(&self) -> f32 {
+        self.inner.origin_y
+    }
+    #[getter]
+    fn advance_width(&self) -> f32 {
+        self.inner.advance_width
+    }
+    #[getter]
     fn rotation_degrees(&self) -> Option<f32> {
         self.inner.rotation_degrees
     }
