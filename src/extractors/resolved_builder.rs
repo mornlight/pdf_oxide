@@ -73,6 +73,9 @@ mod tests {
         collector.push_char(ResolvedChar {
             text: 'A',
             bbox: Rect::new(10.0, 20.0, 5.0, 8.0),
+            origin_x: 10.0,
+            origin_y: 20.0,
+            advance_width: 5.0,
             rotation_degrees: Some(0.0),
         });
         collector.finish_run();
@@ -81,6 +84,9 @@ mod tests {
         collector.push_char(ResolvedChar {
             text: 'B',
             bbox: Rect::new(40.0, 20.0, 5.0, 8.0),
+            origin_x: 40.0,
+            origin_y: 20.0,
+            advance_width: 5.0,
             rotation_degrees: Some(0.0),
         });
         collector.finish_run();

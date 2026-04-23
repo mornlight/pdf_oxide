@@ -2871,11 +2871,7 @@ impl TextExtractor {
             return;
         };
 
-        collector.push_char(ResolvedChar {
-            text: text_char.char,
-            bbox: text_char.bbox,
-            rotation_degrees: Some(text_char.rotation_degrees),
-        });
+        collector.push_char(ResolvedChar::from_text_char(text_char));
     }
 
     fn record_recent_plain_char(&mut self, text_char: &TextChar) {
@@ -8321,6 +8317,46 @@ mod tests {
             "resolved descender bbox should extend lower than the uppercase glyph box: upper={:?}, descender={:?}",
             uppercase.bbox,
             descender.bbox
+        );
+    }
+
+    #[test]
+    fn test_extract_resolved_spans_exposes_origin_box_without_changing_extract_chars() {
+        let mut plain_extractor = TextExtractor::new();
+        plain_extractor.add_font("F1".to_string(), create_test_font());
+        let stream = b"BT /F1 12 Tf 100 700 Td (Ag) Tj ET";
+        let chars = plain_extractor.extract(stream).unwrap();
+
+        assert_eq!(chars.len(), 2);
+        let plain_descender = &chars[1];
+        assert_eq!(plain_descender.char, 'g');
+        assert!(
+            (plain_descender.bbox.y - plain_descender.origin_y).abs() < 0.01,
+            "extract_chars should keep its coarse bbox baseline behavior: {:?}",
+            plain_descender
+        );
+        assert!(
+            (plain_descender.bbox.height - plain_descender.font_size).abs() < 0.01,
+            "extract_chars should keep font-sized origin boxes: {:?}",
+            plain_descender
+        );
+
+        let mut resolved_extractor = TextExtractor::new();
+        resolved_extractor.add_font("F1".to_string(), create_test_font());
+        let spans = resolved_extractor.extract_resolved_spans(stream).unwrap();
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].chars.len(), 2);
+        let resolved_descender = &spans[0].chars[1];
+        assert_eq!(resolved_descender.text, 'g');
+        assert_eq!(resolved_descender.origin_x, plain_descender.origin_x);
+        assert_eq!(resolved_descender.origin_y, plain_descender.origin_y);
+        assert_eq!(resolved_descender.advance_width, plain_descender.advance_width);
+        assert_eq!(spans[0].style.font_size, plain_descender.font_size);
+        assert!(
+            resolved_descender.bbox.y < resolved_descender.origin_y,
+            "resolved glyph bbox should stay separate from the PDF text origin box: {:?}",
+            resolved_descender
         );
     }
 
