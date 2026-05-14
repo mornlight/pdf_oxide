@@ -140,7 +140,7 @@ struct ResolvedTextRuntime {
 
 #[derive(Debug, Default)]
 struct TextRunRuntime {
-    recent_plain_chars: Vec<TextChar>,
+    recent_plain_chars: Vec<RecentCharRecord>,
     resolved: Option<ResolvedTextRuntime>,
 }
 
@@ -155,6 +155,14 @@ impl TextRunRuntime {
             resolved: Some(ResolvedTextRuntime::default()),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct RecentCharRecord {
+    ch: char,
+    font_name: String,
+    origin_x: f32,
+    origin_y: f32,
 }
 
 impl CachedTightFontMetrics {
@@ -2826,7 +2834,7 @@ impl TextExtractor {
         }
     }
 
-    fn push_extracted_char(&mut self, text_char: TextChar, char_code: u32, dedupe_threshold: f32) {
+    fn push_extracted_char(&mut self, text_char: TextChar, dedupe_threshold: f32) {
         if !self.is_resolved_mode()
             && text_char.char.is_whitespace()
             && self
@@ -2836,11 +2844,22 @@ impl TextExtractor {
         {
             return;
         }
-        if self.should_suppress_near_duplicate_char(&text_char, char_code, dedupe_threshold) {
+        if self.should_suppress_near_duplicate_char(
+            text_char.char,
+            &text_char.font_name,
+            text_char.origin_x,
+            text_char.origin_y,
+            dedupe_threshold,
+        ) {
             return;
         }
 
-        self.record_recent_plain_char(&text_char);
+        self.record_recent_char(
+            text_char.char,
+            text_char.font_name.clone(),
+            text_char.origin_x,
+            text_char.origin_y,
+        );
         self.push_resolved_char_if_needed(&text_char);
         if !self.is_resolved_mode() {
             self.chars.push(text_char);
@@ -2874,20 +2893,27 @@ impl TextExtractor {
         collector.push_char(ResolvedChar::from_text_char(text_char));
     }
 
-    fn record_recent_plain_char(&mut self, text_char: &TextChar) {
+    fn record_recent_char(&mut self, ch: char, font_name: String, origin_x: f32, origin_y: f32) {
         let Some(runtime) = self.text_runtime.as_mut() else {
             return;
         };
         if runtime.recent_plain_chars.len() >= 8 {
             runtime.recent_plain_chars.remove(0);
         }
-        runtime.recent_plain_chars.push(text_char.clone());
+        runtime.recent_plain_chars.push(RecentCharRecord {
+            ch,
+            font_name,
+            origin_x,
+            origin_y,
+        });
     }
 
     fn should_suppress_near_duplicate_char(
         &self,
-        text_char: &TextChar,
-        _char_code: u32,
+        ch: char,
+        font_name: &str,
+        origin_x: f32,
+        origin_y: f32,
         dedupe_threshold: f32,
     ) -> bool {
         if dedupe_threshold <= 0.0 {
@@ -2902,11 +2928,53 @@ impl TextExtractor {
             .rev()
             .take(7)
             .any(|previous| {
-                previous.char == text_char.char
-                    && previous.font_name == text_char.font_name
-                    && (previous.origin_x - text_char.origin_x).abs() < dedupe_threshold
-                    && (previous.origin_y - text_char.origin_y).abs() < dedupe_threshold
+                previous.ch == ch
+                    && previous.font_name == font_name
+                    && (previous.origin_x - origin_x).abs() < dedupe_threshold
+                    && (previous.origin_y - origin_y).abs() < dedupe_threshold
             })
+    }
+
+    fn push_resolved_char_direct(
+        &mut self,
+        ch: char,
+        font_name: &str,
+        bbox: Rect,
+        origin_x: f32,
+        origin_y: f32,
+        advance_width: f32,
+        rotation_degrees: f32,
+        dedupe_threshold: f32,
+    ) {
+        if self.should_suppress_near_duplicate_char(
+            ch,
+            font_name,
+            origin_x,
+            origin_y,
+            dedupe_threshold,
+        ) {
+            return;
+        }
+
+        self.record_recent_char(ch, font_name.to_string(), origin_x, origin_y);
+
+        let Some(collector) = self
+            .text_runtime
+            .as_mut()
+            .and_then(|runtime| runtime.resolved.as_mut())
+            .map(|resolved| &mut resolved.collector)
+        else {
+            return;
+        };
+
+        collector.push_char(ResolvedChar {
+            text: ch,
+            bbox,
+            origin_x,
+            origin_y,
+            advance_width,
+            rotation_degrees: Some(rotation_degrees),
+        });
     }
 
     /// Calculate adaptive TJ offset threshold based on font size and text justification.
@@ -4506,22 +4574,22 @@ impl TextExtractor {
                 // (avoids creating thousands of 1-char TextSpans per page).
                 let is_continuation = self.merging_config.merge_tm_tj_runs
                     && match self.tj_span_buffer {
-                    Some(ref mut buffer)
-                        if !buffer.is_empty()
-                            && f.round() as i32 == buffer.start_matrix.f.round() as i32
-                            && a == buffer.start_matrix.a
-                            && b == buffer.start_matrix.b
-                            && c == buffer.start_matrix.c
-                            && d == buffer.start_matrix.d
-                            && e >= buffer.start_matrix.e =>
-                    {
-                        // Same line, same transform, LTR progression →
-                        // update width to reflect actual visual extent
-                        buffer.accumulated_width = e - buffer.start_matrix.e;
-                        true
-                    },
-                    _ => false,
-                };
+                        Some(ref mut buffer)
+                            if !buffer.is_empty()
+                                && f.round() as i32 == buffer.start_matrix.f.round() as i32
+                                && a == buffer.start_matrix.a
+                                && b == buffer.start_matrix.b
+                                && c == buffer.start_matrix.c
+                                && d == buffer.start_matrix.d
+                                && e >= buffer.start_matrix.e =>
+                        {
+                            // Same line, same transform, LTR progression →
+                            // update width to reflect actual visual extent
+                            buffer.accumulated_width = e - buffer.start_matrix.e;
+                            true
+                        },
+                        _ => false,
+                    };
 
                 if !is_continuation {
                     self.flush_tj_span_buffer()?;
@@ -7198,31 +7266,45 @@ impl TextExtractor {
                 )
             };
 
-            let text_char = TextChar {
-                char: unicode_char,
-                bbox,
-                font_name: font_ref.map(|f| f.base_font.clone()).unwrap_or_default(),
-                font_size: effective_font_size,
-                font_weight,
-                color,
-                mcid: self.current_mcid,
-                is_italic: is_italic_char,
-                is_monospace: false,
-                origin_x: char_origin.x,
-                origin_y: char_origin.y,
-                rotation_degrees,
-                advance_width,
-                matrix: Some([
-                    final_matrix.a,
-                    final_matrix.b,
-                    final_matrix.c,
-                    final_matrix.d,
+            if self.is_resolved_mode() {
+                let font_name = font_ref.map(|f| f.base_font.as_str()).unwrap_or("");
+                self.push_resolved_char_direct(
+                    unicode_char,
+                    font_name,
+                    bbox,
                     char_origin.x,
                     char_origin.y,
-                ]),
-            };
+                    advance_width,
+                    rotation_degrees,
+                    duplicate_threshold,
+                );
+            } else {
+                let text_char = TextChar {
+                    char: unicode_char,
+                    bbox,
+                    font_name: font_ref.map(|f| f.base_font.clone()).unwrap_or_default(),
+                    font_size: effective_font_size,
+                    font_weight,
+                    color,
+                    mcid: self.current_mcid,
+                    is_italic: is_italic_char,
+                    is_monospace: false,
+                    origin_x: char_origin.x,
+                    origin_y: char_origin.y,
+                    rotation_degrees,
+                    advance_width,
+                    matrix: Some([
+                        final_matrix.a,
+                        final_matrix.b,
+                        final_matrix.c,
+                        final_matrix.d,
+                        char_origin.x,
+                        char_origin.y,
+                    ]),
+                };
 
-            self.push_extracted_char(text_char, char_code, duplicate_threshold);
+                self.push_extracted_char(text_char, duplicate_threshold);
+            }
 
             x_offset_user += advance_for_char;
         }
@@ -7374,31 +7456,45 @@ impl TextExtractor {
                     )
                 };
 
-                let text_char = TextChar {
-                    char: unicode_char,
-                    bbox,
-                    font_name: font_ref.map(|f| f.base_font.clone()).unwrap_or_default(),
-                    font_size: effective_font_size,
-                    font_weight,
-                    color,
-                    mcid: self.current_mcid,
-                    is_italic: is_italic_char,
-                    is_monospace: false,
-                    origin_x: char_origin.x,
-                    origin_y: char_origin.y,
-                    rotation_degrees,
-                    advance_width,
-                    matrix: Some([
-                        final_matrix.a,
-                        final_matrix.b,
-                        final_matrix.c,
-                        final_matrix.d,
+                if self.is_resolved_mode() {
+                    let font_name = font_ref.map(|f| f.base_font.as_str()).unwrap_or("");
+                    self.push_resolved_char_direct(
+                        unicode_char,
+                        font_name,
+                        bbox,
                         char_origin.x,
                         char_origin.y,
-                    ]),
-                };
+                        advance_width,
+                        rotation_degrees,
+                        duplicate_threshold,
+                    );
+                } else {
+                    let text_char = TextChar {
+                        char: unicode_char,
+                        bbox,
+                        font_name: font_ref.map(|f| f.base_font.clone()).unwrap_or_default(),
+                        font_size: effective_font_size,
+                        font_weight,
+                        color,
+                        mcid: self.current_mcid,
+                        is_italic: is_italic_char,
+                        is_monospace: false,
+                        origin_x: char_origin.x,
+                        origin_y: char_origin.y,
+                        rotation_degrees,
+                        advance_width,
+                        matrix: Some([
+                            final_matrix.a,
+                            final_matrix.b,
+                            final_matrix.c,
+                            final_matrix.d,
+                            char_origin.x,
+                            char_origin.y,
+                        ]),
+                    };
 
-                self.push_extracted_char(text_char, char_code as u32, duplicate_threshold);
+                    self.push_extracted_char(text_char, duplicate_threshold);
+                }
             }
 
             // Advance position: Tx = (w0 * Tfs + Tc + Tw) * Th
